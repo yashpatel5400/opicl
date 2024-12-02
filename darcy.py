@@ -1,15 +1,16 @@
 import torch
 import matplotlib.pyplot as plt
 import sys
-from torch.optim import AdamW
 
-from neuralop.models import FNO
 from neuralop import Trainer
-from neuralop.datasets import load_darcy_flow_small
+from neuralop.training import AdamW
+from neuralop.data.datasets import load_darcy_flow_small
 from neuralop.utils import count_model_params
 from neuralop import LpLoss, H1Loss
 
-device = 'cpu'
+from opformer import FNO
+
+device = 'cuda:0'
 
 train_loader, test_loaders, data_processor = load_darcy_flow_small(
         n_train=1000, batch_size=32, 
@@ -19,7 +20,7 @@ train_loader, test_loaders, data_processor = load_darcy_flow_small(
 data_processor = data_processor.to(device)
 
 model = FNO(n_modes=(16, 16),
-             in_channels=3, 
+             in_channels=1, 
              out_channels=1,
              hidden_channels=32, 
              projection_channel_ratio=2)
@@ -52,6 +53,7 @@ trainer = Trainer(model=model, n_epochs=20,
                   device=device,
                   data_processor=data_processor,
                   wandb_log=False,
+                  eval_interval=3,
                   use_distributed=False,
                   verbose=True)
 
@@ -77,21 +79,21 @@ for index in range(3):
     out = model(x.unsqueeze(0))
 
     ax = fig.add_subplot(3, 3, index*3 + 1)
-    ax.imshow(x[0], cmap='gray')
+    ax.imshow(x[0].cpu().detach().numpy(), cmap='gray')
     if index == 0: 
         ax.set_title('Input x')
     plt.xticks([], [])
     plt.yticks([], [])
 
     ax = fig.add_subplot(3, 3, index*3 + 2)
-    ax.imshow(y.squeeze())
+    ax.imshow(y.squeeze().cpu().detach().numpy())
     if index == 0: 
         ax.set_title('Ground-truth y')
     plt.xticks([], [])
     plt.yticks([], [])
 
     ax = fig.add_subplot(3, 3, index*3 + 3)
-    ax.imshow(out.squeeze().detach().numpy())
+    ax.imshow(out.squeeze().cpu().detach().numpy())
     if index == 0: 
         ax.set_title('Model prediction')
     plt.xticks([], [])
