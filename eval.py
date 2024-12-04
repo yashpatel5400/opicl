@@ -1,5 +1,6 @@
 import argparse
 import einops
+import os
 import matplotlib.pyplot as plt
 import torch
 import torch.amp as amp
@@ -60,7 +61,9 @@ if __name__ == "__main__":
     model = OpFormer(in_chans=1, patch_size=(1,1,1), embed_dim=4, window_size=(8,4,4), num_heads=[1,2,2,2])
     model.to(device)
 
-    checkpoint = torch.load('checkpoint.pth')
+    results_dir = "results"
+    checkpoint_fn = os.path.join(results_dir, f'{args.pde_name}.pth')
+    checkpoint = torch.load(checkpoint_fn)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     for batch_idx, (data, target) in enumerate(dataloader):
@@ -81,5 +84,5 @@ if __name__ == "__main__":
             axs[i,j].get_yaxis().set_visible(False)
 
     plt.tight_layout()
-    plt.savefig("results.png")
+    plt.savefig(os.path.join(results_dir, f"{args.pde_name}.png"))
     plt.clf()
