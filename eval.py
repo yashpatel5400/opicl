@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from train import get_dataset_matlab, get_h5_dataset
 from opformer import OpFormer
 
-sns.set_theme()
+# sns.set_theme()
 
 mpl.rcParams['text.usetex'] = True
 mpl.rcParams['mathtext.fontset'] = 'stix'
@@ -55,10 +55,13 @@ if __name__ == "__main__":
     elif args.pde_name == "swe":
         fn = "./data/2D_rdb_NA_NA.h5"
         dataset, N, hw = get_h5_dataset(fn)
+    elif args.pde_name == "diffreact":
+        fn = "./data/2D_diff-react_NA_NA.h5"
+        dataset, N, hw = get_h5_dataset(fn)
     
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
 
-    model = OpFormer(in_chans=1, patch_size=(1,1,1), embed_dim=4, window_size=(8,4,4), num_heads=[1,2,2,2])
+    model = OpFormer(in_chans=1, patch_size=(1,1,1), embed_dim=4, window_size=(8,4,4), num_heads=[1,2,2,2], hw=hw)
     model.to(device)
 
     results_dir = "results"

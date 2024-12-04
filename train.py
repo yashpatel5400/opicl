@@ -48,6 +48,7 @@ def get_h5_dataset(fn):
     h5_file = h5py.File(fn, "r")
     N = len(h5_file.keys())
     raw_data = np.stack([np.array(h5_file[f"{key}/data"], dtype="f") for key in h5_file.keys()]) # N x T x H x W x C
+    raw_data = raw_data[...,:1] # just consider scalar fields for now
     raw_data = einops.rearrange(raw_data, "n t h w c -> n c h w t")
     raw_data = raw_data[...,:100] # just consider 100 time steps for now
     raw_data = torch.from_numpy(raw_data)
@@ -94,7 +95,7 @@ def train(pde_name, model, train_dataloader, val_dataloader):
         print(f'\nValidation set: Average loss: {val_loss:.4f}\n')
         
         results_dir = "results"
-        os.makedirs(results_dir)
+        os.makedirs(results_dir, exist_ok=True)
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -111,6 +112,9 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--pde_name", type=str, help="Name of the PDE dataset to fit to"
     )
+    arg_parser.add_argument(
+        "--resume", action='store_true', help="Whether to resume training from a previous run (i.e. checkpoint)"
+    )
     args = arg_parser.parse_args()
 
     if args.pde_name == "ns":
@@ -118,6 +122,9 @@ if __name__ == "__main__":
         dataset, N, hw = get_dataset_matlab(fn)
     elif args.pde_name == "swe":
         fn = "./data/2D_rdb_NA_NA.h5"
+        dataset, N, hw = get_h5_dataset(fn)
+    elif args.pde_name == "diffreact":
+        fn = "./data/2D_diff-react_NA_NA.h5"
         dataset, N, hw = get_h5_dataset(fn)
 
     prop_train = 0.8
@@ -129,4 +136,10 @@ if __name__ == "__main__":
 
     model = OpFormer(in_chans=1, patch_size=(1,1,1), embed_dim=4, window_size=(8,4,4), num_heads=[1,2,2,2], hw=hw)
     model.to(device)
+
+    if args.resume:
+        checkpoint_fn = os.path.join("results", f'{args.pde_name}.pth')
+        checkpoint = torch.load(checkpoint_fn)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
     train(args.pde_name, model, train_dataloader, val_dataloader)
