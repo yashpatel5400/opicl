@@ -1,3 +1,4 @@
+import argparse
 import einops
 import matplotlib.pyplot as plt
 import torch
@@ -7,10 +8,12 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from torch.utils.data import DataLoader, Dataset
 
-
 import seaborn as sns
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+
+from train import get_dataset_matlab, get_h5_dataset
+from opformer import OpFormer
 
 sns.set_theme()
 
@@ -32,15 +35,27 @@ plt.rc('ytick', labelsize=BIGGER_SIZE)    # fontsize of the tick labels
 plt.rc('legend', fontsize=BIGGER_SIZE)    # legend fontsize
 plt.rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
 
-from train import get_dataset
-from opformer import OpFormer
-
 device = "cuda:0"
 
 if __name__ == "__main__":
-    fn = "ns_data.mat"
-    dataset, N = get_dataset(fn)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+    arg_parser = argparse.ArgumentParser(
+        prog="Train PDE Solver",
+        description="Training script to fit OpFormer in the PDEBench dataset",
+        epilog="",
+    )
+    arg_parser.add_argument(
+        "--pde_name", type=str, help="Name of the PDE dataset to fit to"
+    )
+    args = arg_parser.parse_args()
+
+    if args.pde_name == "ns":
+        fn = "ns_data.mat"
+        dataset, N, hw = get_dataset_matlab(fn)
+    elif args.pde_name == "swe":
+        fn = "./data/2D_rdb_NA_NA.h5"
+        dataset, N, hw = get_h5_dataset(fn)
+    
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
 
     model = OpFormer(in_chans=1, patch_size=(1,1,1), embed_dim=4, window_size=(8,4,4), num_heads=[1,2,2,2])
     model.to(device)

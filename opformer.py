@@ -495,6 +495,7 @@ class OpFormer(nn.Module):
     def __init__(self,
                  pretrained=None,
                  pretrained2d=True,
+                 hw=(64,64),
                  patch_size=(4,4,4),
                  in_chans=3,
                  embed_dim=96,
@@ -556,7 +557,8 @@ class OpFormer(nn.Module):
         # add a norm layer for each output
         self.norm = norm_layer(self.num_features)
 
-        self.resize_linear = nn.Linear(2048, 64 * 64)
+        self.hw = hw
+        self.resize_linear = nn.Linear(hw[0] * hw[1] // 2, hw[0] * hw[1])
         
         self._freeze_stages()
 
@@ -675,7 +677,7 @@ class OpFormer(nn.Module):
         x = einops.reduce(x, 'n d h w c -> n h w c', "sum")
         x = rearrange(x, 'n h w c -> n (h w c)')
         x = self.resize_linear(x)
-        x = rearrange(x, 'n (h w c) -> n c h w', h = 64, w = 64, c = 1)
+        x = rearrange(x, 'n (h w c) -> n c h w', h = self.hw[0], w = self.hw[1], c = 1)
 
         return x
 
