@@ -276,7 +276,7 @@ if __name__ == "__main__":
     s = 64
 
     #Number of solutions to generate
-    N = 10_000
+    N = 1_000
 
     #Set up 2d GRF with covariance parameters
     GRF = GaussianRF(2, s, alpha=2.5, tau=7, device=device)
@@ -300,7 +300,7 @@ if __name__ == "__main__":
     #Solve equations in batches (order of magnitude speed-up)
 
     #Batch size
-    bsize = 2_500
+    bsize = 1_000
 
     c = 0
     t0 = default_timer()

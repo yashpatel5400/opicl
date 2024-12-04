@@ -1,623 +1,685 @@
-from functools import partialmethod
-from typing import Tuple, List, Union
-
-Number = Union[float, int]
-
+import einops
 import torch
+import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
-from neuralop.layers.embeddings import GridEmbeddingND, GridEmbedding2D
-from neuralop.layers.spectral_convolution import SpectralConv
-from neuralop.layers.padding import DomainPadding
-from neuralop.layers.fno_block import FNOBlocks
-from neuralop.layers.channel_mlp import ChannelMLP
-from neuralop.layers.complex import ComplexValued
-from neuralop.models.base_model import BaseModel
+import numpy as np
+from timm.models.layers import DropPath, trunc_normal_
 
-class FNO(BaseModel, name='FNO'):
-    """N-Dimensional Fourier Neural Operator. The FNO learns a mapping between
-    spaces of functions discretized over regular grids using Fourier convolutions, 
-    as described in [1]_.
-    
-    The key component of an FNO is its SpectralConv layer (see 
-    ``neuralop.layers.spectral_convolution``), which is similar to a standard CNN 
-    conv layer but operates in the frequency domain.
+from mmcv.runner import load_checkpoint
+from mmaction.utils import get_root_logger
 
-    For a deeper dive into the FNO architecture, refer to :ref:`fno_intro`.
+from functools import reduce, lru_cache
+from operator import mul
+from einops import rearrange
 
-    Parameters
-    ----------
-    n_modes : Tuple[int]
-        number of modes to keep in Fourier Layer, along each dimension
-        The dimensionality of the FNO is inferred from ``len(n_modes)``
-    in_channels : int
-        Number of channels in input function
-    out_channels : int
-        Number of channels in output function
-    hidden_channels : int
-        width of the FNO (i.e. number of channels), by default 256
-    n_layers : int, optional
-        Number of Fourier Layers, by default 4
+from spectral_conv import SpectralConvolution
 
-    Documentation for more advanced parameters is below.
+class Mlp(nn.Module):
+    """ Multilayer perceptron."""
 
-    Other parameters
-    ------------------
-    lifting_channel_ratio : int, optional
-        ratio of lifting channels to hidden_channels, by default 2
-        The number of liting channels in the lifting block of the FNO is
-        lifting_channel_ratio * hidden_channels (e.g. default 512)
-    projection_channel_ratio : int, optional
-        ratio of projection channels to hidden_channels, by default 2
-        The number of projection channels in the projection block of the FNO is
-        projection_channel_ratio * hidden_channels (e.g. default 512)
-    positional_embedding : Union[str, nn.Module], optional
-        Positional embedding to apply to last channels of raw input
-        before being passed through the FNO. Defaults to "grid"
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
 
-        * If "grid", appends a grid positional embedding with default settings to 
-        the last channels of raw input. Assumes the inputs are discretized
-        over a grid with entry [0,0,...] at the origin and side lengths of 1.
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
 
-        * If an initialized GridEmbedding module, uses this module directly
-        See :mod:`neuralop.embeddings.GridEmbeddingND` for details.
 
-        * If None, does nothing
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, D, H, W, C)
+        window_size (tuple[int]): window size
 
-    non_linearity : nn.Module, optional
-        Non-Linear activation function module to use, by default F.gelu
-    norm : str {"ada_in", "group_norm", "instance_norm"}, optional
-        Normalization layer to use, by default None
-    complex_data : bool, optional
-        Whether data is complex-valued (default False)
-        if True, initializes complex-valued modules.
-    channel_mlp_dropout : float, optional
-        dropout parameter for ChannelMLP in FNO Block, by default 0
-    channel_mlp_expansion : float, optional
-        expansion parameter for ChannelMLP in FNO Block, by default 0.5
-    channel_mlp_skip : str {'linear', 'identity', 'soft-gating'}, optional
-        Type of skip connection to use in channel-mixing mlp, by default 'soft-gating'
-    fno_skip : str {'linear', 'identity', 'soft-gating'}, optional
-        Type of skip connection to use in FNO layers, by default 'linear'
-    resolution_scaling_factor : Union[Number, List[Number]], optional
-        layer-wise factor by which to scale the domain resolution of function, by default None
-        
-        * If a single number n, scales resolution by n at each layer
+    Returns:
+        windows: (B*num_windows, window_size*window_size, C)
+    """
+    B, D, H, W, C = x.shape
+    x = x.view(B, D // window_size[0], window_size[0], H // window_size[1], window_size[1], W // window_size[2], window_size[2], C)
+    windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, reduce(mul, window_size), C)
+    return windows
 
-        * if a list of numbers [n_0, n_1,...] scales layer i's resolution by n_i.
-    domain_padding : Union[Number, List[Number]], optional
-        If not None, percentage of padding to use, by default None
-        To vary the percentage of padding used along each input dimension,
-        pass in a list of percentages e.g. [p1, p2, ..., pN] such that
-        p1 corresponds to the percentage of padding along dim 1, etc.
-    domain_padding_mode : str {'symmetric', 'one-sided'}, optional
-        How to perform domain padding, by default 'one-sided'
-    fno_block_precision : str {'full', 'half', 'mixed'}, optional
-        precision mode in which to perform spectral convolution, by default "full"
-    stabilizer : str {'tanh'} | None, optional
-        whether to use a tanh stabilizer in FNO block, by default None
 
-        Note: stabilizer greatly improves performance in the case
-        `fno_block_precision='mixed'`. 
+def window_reverse(windows, window_size, B, D, H, W):
+    """
+    Args:
+        windows: (B*num_windows, window_size, window_size, C)
+        window_size (tuple[int]): Window size
+        H (int): Height of image
+        W (int): Width of image
 
-    max_n_modes : Tuple[int] | None, optional
+    Returns:
+        x: (B, D, H, W, C)
+    """
+    x = windows.view(B, D // window_size[0], H // window_size[1], W // window_size[2], window_size[0], window_size[1], window_size[2], -1)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, D, H, W, -1)
+    return x
 
-        * If not None, this allows to incrementally increase the number of
-        modes in Fourier domain during training. Has to verify n <= N
-        for (n, m) in zip(max_n_modes, n_modes).
 
-        * If None, all the n_modes are used.
+def get_window_size(x_size, window_size, shift_size=None):
+    use_window_size = list(window_size)
+    if shift_size is not None:
+        use_shift_size = list(shift_size)
+    for i in range(len(x_size)):
+        if x_size[i] <= window_size[i]:
+            use_window_size[i] = x_size[i]
+            if shift_size is not None:
+                use_shift_size[i] = 0
 
-        This can be updated dynamically during training.
-    factorization : str, optional
-        Tensor factorization of the FNO layer weights to use, by default None.
+    if shift_size is None:
+        return tuple(use_window_size)
+    else:
+        return tuple(use_window_size), tuple(use_shift_size)
 
-        * If None, a dense tensor parametrizes the Spectral convolutions
 
-        * Otherwise, the specified tensor factorization is used.
-    rank : float, optional
-        tensor rank to use in above factorization, by default 1.0
-    fixed_rank_modes : bool, optional
-        Modes to not factorize, by default False
-    implementation : str {'factorized', 'reconstructed'}, optional
-
-        * If 'factorized', implements tensor contraction with the individual factors of the decomposition 
-        
-        * If 'reconstructed', implements with the reconstructed full tensorized weight.
-    decomposition_kwargs : dict, optional
-        extra kwargs for tensor decomposition (see `tltorch.FactorizedTensor`), by default dict()
-    separable : bool, optional (**DEACTIVATED**)
-        if True, use a depthwise separable spectral convolution, by default False   
-    preactivation : bool, optional (**DEACTIVATED**)
-        whether to compute FNO forward pass with resnet-style preactivation, by default False
-    conv_module : nn.Module, optional
-        module to use for FNOBlock's convolutions, by default SpectralConv
-    
-    Examples
-    ---------
-    
-    >>> from neuralop.models import FNO
-    >>> model = FNO(n_modes=(12,12), in_channels=1, out_channels=1, hidden_channels=64)
-    >>> model
-    FNO(
-    (positional_embedding): GridEmbeddingND()
-    (fno_blocks): FNOBlocks(
-        (convs): SpectralConv(
-        (weight): ModuleList(
-            (0-3): 4 x DenseTensor(shape=torch.Size([64, 64, 12, 7]), rank=None)
-        )
-        )
-            ... torch.nn.Module printout truncated ...
-
-    References
-    -----------
-    .. [1] :
-
-    Li, Z. et al. "Fourier Neural Operator for Parametric Partial Differential 
-        Equations" (2021). ICLR 2021, https://arxiv.org/pdf/2010.08895.
-
+class WindowAttention3D(nn.Module):
+    """ Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+    Args:
+        dim (int): Number of input channels.
+        window_size (tuple[int]): The temporal length, height and width of the window.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(
-        self,
-        n_modes: Tuple[int],
-        in_channels: int,
-        out_channels: int,
-        hidden_channels: int,
-        n_layers: int=4,
-        lifting_channel_ratio: int=2,
-        projection_channel_ratio: int=2,
-        positional_embedding: Union[str, nn.Module]="grid",
-        non_linearity: nn.Module=F.gelu,
-        norm: str=None,
-        complex_data: bool=False,
-        channel_mlp_dropout: float=0,
-        channel_mlp_expansion: float=0.5,
-        channel_mlp_skip: str="soft-gating",
-        fno_skip: str="linear",
-        resolution_scaling_factor: Union[Number, List[Number]]=None,
-        domain_padding: Union[Number, List[Number]]=None,
-        domain_padding_mode: str="one-sided",
-        fno_block_precision: str="full",
-        stabilizer: str=None,
-        max_n_modes: Tuple[int]=None,
-        factorization: str=None,
-        rank: float=1.0,
-        fixed_rank_modes: bool=False,
-        implementation: str="factorized",
-        decomposition_kwargs: dict=dict(),
-        separable: bool=False,
-        preactivation: bool=False,
-        conv_module: nn.Module=SpectralConv,
-        **kwargs
-    ):
-        
+    def __init__(self, dim, window_size, num_heads, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+
         super().__init__()
-        self.n_dim = len(n_modes)
+        self.dim = dim
+        self.window_size = window_size  # Wd, Wh, Ww
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # define a parameter table of relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1) * (2 * window_size[2] - 1), num_heads))  # 2*Wd-1 * 2*Wh-1 * 2*Ww-1, nH
+
+        # get pair-wise relative position index for each token inside the window
+        coords_d = torch.arange(self.window_size[0])
+        coords_h = torch.arange(self.window_size[1])
+        coords_w = torch.arange(self.window_size[2])
+        coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w))  # 3, Wd, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 3, Wd*Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 3, Wd*Wh*Ww, Wd*Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wd*Wh*Ww, Wd*Wh*Ww, 3
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 2] += self.window_size[2] - 1
+
+        relative_coords[:, :, 0] *= (2 * self.window_size[1] - 1) * (2 * self.window_size[2] - 1)
+        relative_coords[:, :, 1] *= (2 * self.window_size[2] - 1)
+        relative_position_index = relative_coords.sum(-1)  # Wd*Wh*Ww, Wd*Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(num_heads * dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, qkv, mask=None):
+        """ Forward function.
+        Args:
+            x: input features with shape of (num_windows*B, N, 3C)
+            mask: (0/-inf) mask with shape of (num_windows, N, N) or None
+        """
+        B_, N, C = qkv.shape
+        C //= 3
         
-        # n_modes is a special property - see the class' property for underlying mechanism
-        # When updated, change should be reflected in fno blocks
-        self._n_modes = n_modes
-
-        self.hidden_channels = hidden_channels
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.n_layers = n_layers
-
-        # init lifting and projection channels using ratios w.r.t hidden channels
-        self.lifting_channel_ratio = lifting_channel_ratio
-        self.lifting_channels = lifting_channel_ratio * self.hidden_channels
-
-        self.projection_channel_ratio = projection_channel_ratio
-        self.projection_channels = projection_channel_ratio * self.hidden_channels
-
-        self.non_linearity = non_linearity
-        self.rank = rank
-        self.factorization = factorization
-        self.fixed_rank_modes = fixed_rank_modes
-        self.decomposition_kwargs = decomposition_kwargs
-        self.fno_skip = (fno_skip,)
-        self.channel_mlp_skip = (channel_mlp_skip,)
-        self.implementation = implementation
-        self.separable = separable
-        self.preactivation = preactivation
-        self.complex_data = complex_data
-        self.fno_block_precision = fno_block_precision
+        # qkv = self.qkv(x)
         
-        if positional_embedding == "grid":
-            spatial_grid_boundaries = [[0., 1.]] * self.n_dim
-            self.positional_embedding = GridEmbeddingND(in_channels=self.in_channels,
-                                                        dim=self.n_dim, 
-                                                        grid_boundaries=spatial_grid_boundaries)
-        elif isinstance(positional_embedding, GridEmbedding2D):
-            if self.n_dim == 2:
-                self.positional_embedding = positional_embedding
-            else:
-                raise ValueError(f'Error: expected {self.n_dim}-d positional embeddings, got {positional_embedding}')
-        elif isinstance(positional_embedding, GridEmbeddingND):
-            self.positional_embedding = positional_embedding
-        elif positional_embedding == None:
-            self.positional_embedding = None
+        qkv = qkv.reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # B_, nH, N, C
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index[:N, :N].reshape(-1)].reshape(
+            N, N, -1)  # Wd*Wh*Ww,Wd*Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wd*Wh*Ww, Wd*Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0) # B_, nH, N, N
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
         else:
-            raise ValueError(f"Error: tried to instantiate FNO positional embedding with {positional_embedding},\
-                              expected one of \'grid\', GridEmbeddingND")
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class OpFormerBlock3D(nn.Module):
+    """ Swin Transformer Block.
+
+    Args:
+        dim (int): Number of input channels.
+        num_heads (int): Number of attention heads.
+        window_size (tuple[int]): Window size.
+        shift_size (tuple[int]): Shift size for SW-MSA.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, dim, num_heads, window_size=(2,7,7), shift_size=(0,0,0),
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_checkpoint=False):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        self.use_checkpoint=use_checkpoint
+
+        assert 0 <= self.shift_size[0] < self.window_size[0], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[1] < self.window_size[1], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[2] < self.window_size[2], "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+
+        k_max = 16
+        self.qkv = SpectralConvolution(dim, 3 * dim * num_heads, [k_max, k_max])
+        self.attn = WindowAttention3D(
+            dim, window_size=self.window_size, num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward_part1(self, x, mask_matrix):
+        B, D, H, W, C = x.shape
+        window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
+
+        x = self.norm1(x)
         
-        if domain_padding is not None and (
-            (isinstance(domain_padding, list) and sum(domain_padding) > 0)
-            or (isinstance(domain_padding, (float, int)) and domain_padding > 0)
-        ):
-            self.domain_padding = DomainPadding(
-                domain_padding=domain_padding,
-                padding_mode=domain_padding_mode,
-                resolution_scaling_factor=resolution_scaling_factor,
-            )
+        # pad feature maps to multiples of window size
+        pad_l = pad_t = pad_d0 = 0
+        pad_d1 = (window_size[0] - D % window_size[0]) % window_size[0]
+        pad_b = (window_size[1] - H % window_size[1]) % window_size[1]
+        pad_r = (window_size[2] - W % window_size[2]) % window_size[2]
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1))
+        _, Dp, Hp, Wp, _ = x.shape
+        # cyclic shift
+        if any(i > 0 for i in shift_size):
+            shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3))
+            attn_mask = mask_matrix
         else:
-            self.domain_padding = None
-
-        self.domain_padding_mode = domain_padding_mode
-        self.complex_data = self.complex_data
-
-        if resolution_scaling_factor is not None:
-            if isinstance(resolution_scaling_factor, (float, int)):
-                resolution_scaling_factor = [resolution_scaling_factor] * self.n_layers
-        self.resolution_scaling_factor = resolution_scaling_factor
-
-        self.fno_blocks = FNOBlocks(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            n_modes=self.n_modes,
-            resolution_scaling_factor=resolution_scaling_factor,
-            channel_mlp_dropout=channel_mlp_dropout,
-            channel_mlp_expansion=channel_mlp_expansion,
-            non_linearity=non_linearity,
-            stabilizer=stabilizer,
-            norm=norm,
-            preactivation=preactivation,
-            fno_skip=fno_skip,
-            channel_mlp_skip=channel_mlp_skip,
-            complex_data=complex_data,
-            max_n_modes=max_n_modes,
-            fno_block_precision=fno_block_precision,
-            rank=rank,
-            fixed_rank_modes=fixed_rank_modes,
-            implementation=implementation,
-            separable=separable,
-            factorization=factorization,
-            decomposition_kwargs=decomposition_kwargs,
-            conv_module=conv_module,
-            n_layers=n_layers,
-            **kwargs
-        )
+            shifted_x = x
+            attn_mask = None
         
-        # if adding a positional embedding, add those channels to lifting
-        lifting_in_channels = self.in_channels
-        if self.positional_embedding is not None:
-            lifting_in_channels += self.n_dim
-        # if lifting_channels is passed, make lifting a Channel-Mixing MLP
-        # with a hidden layer of size lifting_channels
-        if self.lifting_channels:
-            self.lifting = ChannelMLP(
-                in_channels=lifting_in_channels,
-                out_channels=self.hidden_channels,
-                hidden_channels=self.lifting_channels,
-                n_layers=2,
-                n_dim=self.n_dim,
-                non_linearity=non_linearity
-            )
-        # otherwise, make it a linear layer
+        shifted_x = rearrange(shifted_x, "n t h w c -> n c h w t")
+        qkv = self.qkv(shifted_x)
+        qkv = rearrange(qkv, "n c h w t -> n t h w c")
+        
+        # partition windows
+        x_windows = window_partition(qkv, window_size)  # B*nW, Wd*Wh*Ww, C
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # B*nW, Wd*Wh*Ww, C
+        # merge windows
+        attn_windows = attn_windows.view(-1, *(window_size+(C,)))
+        shifted_x = window_reverse(attn_windows, window_size, B, Dp, Hp, Wp)  # B D' H' W' C
+        # reverse cyclic shift
+        if any(i > 0 for i in shift_size):
+            x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
         else:
-            self.lifting = ChannelMLP(
-                in_channels=lifting_in_channels,
-                hidden_channels=self.hidden_channels,
-                out_channels=self.hidden_channels,
-                n_layers=1,
-                n_dim=self.n_dim,
-                non_linearity=non_linearity
-            )
-        # Convert lifting to a complex ChannelMLP if self.complex_data==True
-        if self.complex_data:
-            self.lifting = ComplexValued(self.lifting)
+            x = shifted_x
 
-        self.projection = ChannelMLP(
-            in_channels=self.hidden_channels,
-            out_channels=out_channels,
-            hidden_channels=self.projection_channels,
-            n_layers=2,
-            n_dim=self.n_dim,
-            non_linearity=non_linearity,
-        )
-        if self.complex_data:
-            self.projection = ComplexValued(self.projection)
+        if pad_d1 >0 or pad_r > 0 or pad_b > 0:
+            x = x[:, :D, :H, :W, :].contiguous()
+        return x
 
-    def forward(self, x, output_shape=None, **kwargs):
-        """FNO's forward pass
-        
-        1. Applies optional positional encoding
+    def forward_part2(self, x):
+        return self.drop_path(self.mlp(self.norm2(x)))
 
-        2. Sends inputs through a lifting layer to a high-dimensional latent
-            space
+    def forward(self, x, mask_matrix):
+        """ Forward function.
 
-        3. Applies optional domain padding to high-dimensional intermediate function representation
-
-        4. Applies `n_layers` Fourier/FNO layers in sequence (SpectralConvolution + skip connections, nonlinearity) 
-
-        5. If domain padding was applied, domain padding is removed
-
-        6. Projection of intermediate function representation to the output channels
-
-        Parameters
-        ----------
-        x : tensor
-            input tensor
-        
-        output_shape : {tuple, tuple list, None}, default is None
-            Gives the option of specifying the exact output shape for odd shaped inputs.
-            
-            * If None, don't specify an output shape
-
-            * If tuple, specifies the output-shape of the **last** FNO Block
-
-            * If tuple list, specifies the exact output-shape of each FNO Block
+        Args:
+            x: Input feature, tensor size (B, D, H, W, C).
+            mask_matrix: Attention mask for cyclic shift.
         """
 
-        if output_shape is None:
-            output_shape = [None]*self.n_layers
-        elif isinstance(output_shape, tuple):
-            output_shape = [None]*(self.n_layers - 1) + [output_shape]
+        shortcut = x
+        if self.use_checkpoint:
+            x = checkpoint.checkpoint(self.forward_part1, x, mask_matrix)
+        else:
+            x = self.forward_part1(x, mask_matrix)
+        x = shortcut + self.drop_path(x)
 
-        # append spatial pos embedding if set
-        if self.positional_embedding is not None:
-            x = self.positional_embedding(x)
-        
-        x = self.lifting(x)
-
-        if self.domain_padding is not None:
-            x = self.domain_padding.pad(x)
-
-        for layer_idx in range(self.n_layers):
-            x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
-
-        if self.domain_padding is not None:
-            x = self.domain_padding.unpad(x)
-
-        x = self.projection(x)
+        if self.use_checkpoint:
+            x = x + checkpoint.checkpoint(self.forward_part2, x)
+        else:
+            x = x + self.forward_part2(x)
 
         return x
 
-    @property
-    def n_modes(self):
-        return self._n_modes
 
-    @n_modes.setter
-    def n_modes(self, n_modes):
-        self.fno_blocks.n_modes = n_modes
-        self._n_modes = n_modes
+class PatchMerging(nn.Module):
+    """ Patch Merging Layer
+
+    Args:
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+    def __init__(self, dim, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = norm_layer(4 * dim)
+
+    def forward(self, x):
+        """ Forward function.
+
+        Args:
+            x: Input feature, tensor size (B, D, H, W, C).
+        """
+        B, D, H, W, C = x.shape
+        
+        # padding
+        pad_input = (H % 2 == 1) or (W % 2 == 1)
+        if pad_input:
+            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+
+        x0 = x[:, :, 0::2, 0::2, :]  # B D H/2 W/2 C
+        x1 = x[:, :, 1::2, 0::2, :]  # B D H/2 W/2 C
+        x2 = x[:, :, 0::2, 1::2, :]  # B D H/2 W/2 C
+        x3 = x[:, :, 1::2, 1::2, :]  # B D H/2 W/2 C
+        x = torch.cat([x0, x1, x2, x3], -1)  # B D H/2 W/2 4*C
+
+        x = self.norm(x)
+        x = self.reduction(x)
+
+        return x
 
 
-class FNO1d(FNO):
-    """1D Fourier Neural Operator
+# cache each stage results
+@lru_cache()
+def compute_mask(D, H, W, window_size, shift_size, device):
+    img_mask = torch.zeros((1, D, H, W, 1), device=device)  # 1 Dp Hp Wp 1
+    cnt = 0
+    for d in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0],None):
+        for h in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1],None):
+            for w in slice(-window_size[2]), slice(-window_size[2], -shift_size[2]), slice(-shift_size[2],None):
+                img_mask[:, d, h, w, :] = cnt
+                cnt += 1
+    mask_windows = window_partition(img_mask, window_size)  # nW, ws[0]*ws[1]*ws[2], 1
+    mask_windows = mask_windows.squeeze(-1)  # nW, ws[0]*ws[1]*ws[2]
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+    return attn_mask
 
-    For the full list of parameters, see :class:`neuralop.models.FNO`.
 
-    Parameters
-    ----------
-    modes_height : int
-        number of Fourier modes to keep along the height
+class BasicLayer(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
+
+    Args:
+        dim (int): Number of feature channels
+        depth (int): Depths of this stage.
+        num_heads (int): Number of attention head.
+        window_size (tuple[int]): Local window size. Default: (1,7,7).
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
     """
 
-    def __init__(
-        self,
-        n_modes_height,
-        hidden_channels,
-        in_channels=3,
-        out_channels=1,
-        lifting_channels=256,
-        projection_channels=256,
-        max_n_modes=None,
-        n_layers=4,
-        resolution_scaling_factor=None,
-        non_linearity=F.gelu,
-        stabilizer=None,
-        complex_data=False,
-        fno_block_precision="full",
-        channel_mlp_dropout=0,
-        channel_mlp_expansion=0.5,
-        norm=None,
-        skip="soft-gating",
-        separable=False,
-        preactivation=False,
-        factorization=None,
-        rank=1.0,
-        fixed_rank_modes=False,
-        implementation="factorized",
-        decomposition_kwargs=dict(),
-        domain_padding=None,
-        domain_padding_mode="one-sided",
-        **kwargs
-    ):
-        super().__init__(
-            n_modes=(n_modes_height,),
-            hidden_channels=hidden_channels,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            lifting_channels=lifting_channels,
-            projection_channels=projection_channels,
-            n_layers=n_layers,
-            resolution_scaling_factor=resolution_scaling_factor,
-            non_linearity=non_linearity,
-            stabilizer=stabilizer,
-            complex_data=complex_data,
-            fno_block_precision=fno_block_precision,
-            channel_mlp_dropout=channel_mlp_dropout,
-            channel_mlp_expansion=channel_mlp_expansion,
-            max_n_modes=max_n_modes,
-            norm=norm,
-            skip=skip,
-            separable=separable,
-            preactivation=preactivation,
-            factorization=factorization,
-            rank=rank,
-            fixed_rank_modes=fixed_rank_modes,
-            implementation=implementation,
-            decomposition_kwargs=decomposition_kwargs,
-            domain_padding=domain_padding,
-            domain_padding_mode=domain_padding_mode,
-        )
-        self.n_modes_height = n_modes_height
+    def __init__(self,
+                 dim,
+                 depth,
+                 num_heads,
+                 window_size=(1,7,7),
+                 mlp_ratio=4.,
+                 qkv_bias=False,
+                 qk_scale=None,
+                 drop=0.,
+                 attn_drop=0.,
+                 drop_path=0.,
+                 norm_layer=nn.LayerNorm,
+                 downsample=None,
+                 use_checkpoint=False):
+        super().__init__()
+        self.window_size = window_size
+        self.shift_size = tuple(i // 2 for i in window_size)
+        self.depth = depth
+        self.use_checkpoint = use_checkpoint
+
+        # build blocks
+        self.blocks = nn.ModuleList([
+            OpFormerBlock3D(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=(0,0,0) if (i % 2 == 0) else self.shift_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop,
+                attn_drop=attn_drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer,
+                use_checkpoint=use_checkpoint,
+            )
+            for i in range(depth)])
+        
+        self.downsample = downsample
+        if self.downsample is not None:
+            self.downsample = downsample(dim=dim, norm_layer=norm_layer)
+
+    def forward(self, x):
+        """ Forward function.
+
+        Args:
+            x: Input feature, tensor size (B, C, D, H, W).
+        """
+        # calculate attention mask for SW-MSA
+        B, C, D, H, W = x.shape
+        
+        window_size, shift_size = get_window_size((D,H,W), self.window_size, self.shift_size)
+        x = rearrange(x, 'b c d h w -> b d h w c')
+        Dp = int(np.ceil(D / window_size[0])) * window_size[0]
+        Hp = int(np.ceil(H / window_size[1])) * window_size[1]
+        Wp = int(np.ceil(W / window_size[2])) * window_size[2]
+        attn_mask = compute_mask(Dp, Hp, Wp, window_size, shift_size, x.device)
+        for blk in self.blocks:
+            x = blk(x, attn_mask)
+        x = x.view(B, D, H, W, -1)
+
+        if self.downsample is not None:
+            x = self.downsample(x)
+        x = rearrange(x, 'b d h w c -> b c d h w')
+        return x
 
 
-class FNO2d(FNO):
-    """2D Fourier Neural Operator
+class PatchEmbed3D(nn.Module):
+    """ Video to Patch Embedding.
 
-    For the full list of parameters, see :class:`neuralop.models.FNO`.
+    Args:
+        patch_size (int): Patch token size. Default: (2,4,4).
+        in_chans (int): Number of input video channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+    def __init__(self, patch_size=(2,4,4), in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        self.patch_size = patch_size
 
-    Parameters
-    ----------
-    n_modes_width : int
-        number of modes to keep in Fourier Layer, along the width
-    n_modes_height : int
-        number of Fourier modes to keep along the height
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
+
+    def forward(self, x):
+        """Forward function."""
+        # padding
+        _, _, D, H, W = x.size()
+        if W % self.patch_size[2] != 0:
+            x = F.pad(x, (0, self.patch_size[2] - W % self.patch_size[2]))
+        if H % self.patch_size[1] != 0:
+            x = F.pad(x, (0, 0, 0, self.patch_size[1] - H % self.patch_size[1]))
+        if D % self.patch_size[0] != 0:
+            x = F.pad(x, (0, 0, 0, 0, 0, self.patch_size[0] - D % self.patch_size[0]))
+
+        x = self.proj(x)  # B C D Wh Ww
+        if self.norm is not None:
+            D, Wh, Ww = x.size(2), x.size(3), x.size(4)
+            x = x.flatten(2).transpose(1, 2)
+            x = self.norm(x)
+            x = x.transpose(1, 2).view(-1, self.embed_dim, D, Wh, Ww)
+
+        return x
+
+class OpFormer(nn.Module):
+    """ Operator Transformer model
+
+    Args:
+        patch_size (int | tuple(int)): Patch size. Default: (4,4,4).
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        depths (tuple[int]): Depths of each Swin Transformer stage.
+        num_heads (tuple[int]): Number of attention head of each stage.
+        window_size (int): Window size. Default: 7.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4.
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: Truee
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set.
+        drop_rate (float): Dropout rate.
+        attn_drop_rate (float): Attention dropout rate. Default: 0.
+        drop_path_rate (float): Stochastic depth rate. Default: 0.2.
+        norm_layer: Normalization layer. Default: nn.LayerNorm.
+        patch_norm (bool): If True, add normalization after patch embedding. Default: False.
+        frozen_stages (int): Stages to be frozen (stop grad and set eval mode).
+            -1 means not freezing any parameters.
     """
 
-    def __init__(
-        self,
-        n_modes_height,
-        n_modes_width,
-        hidden_channels,
-        in_channels=3,
-        out_channels=1,
-        lifting_channels=256,
-        projection_channels=256,
-        n_layers=4,
-        resolution_scaling_factor=None,
-        max_n_modes=None,
-        non_linearity=F.gelu,
-        stabilizer=None,
-        complex_data=False,
-        fno_block_precision="full",
-        channel_mlp_dropout=0,
-        channel_mlp_expansion=0.5,
-        norm=None,
-        skip="soft-gating",
-        separable=False,
-        preactivation=False,
-        factorization=None,
-        rank=1.0,
-        fixed_rank_modes=False,
-        implementation="factorized",
-        decomposition_kwargs=dict(),
-        domain_padding=None,
-        domain_padding_mode="one-sided",
-        **kwargs
-    ):
-        super().__init__(
-            n_modes=(n_modes_height, n_modes_width),
-            hidden_channels=hidden_channels,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            lifting_channels=lifting_channels,
-            projection_channels=projection_channels,
-            n_layers=n_layers,
-            resolution_scaling_factor=resolution_scaling_factor,
-            non_linearity=non_linearity,
-            stabilizer=stabilizer,
-            complex_data=complex_data,
-            fno_block_precision=fno_block_precision,
-            channel_mlp_dropout=channel_mlp_dropout,
-            channel_mlp_expansion=channel_mlp_expansion,
-            max_n_modes=max_n_modes,
-            norm=norm,
-            skip=skip,
-            separable=separable,
-            preactivation=preactivation,
-            factorization=factorization,
-            rank=rank,
-            fixed_rank_modes=fixed_rank_modes,
-            implementation=implementation,
-            decomposition_kwargs=decomposition_kwargs,
-            domain_padding=domain_padding,
-            domain_padding_mode=domain_padding_mode,
-        )
-        self.n_modes_height = n_modes_height
-        self.n_modes_width = n_modes_width
+    def __init__(self,
+                 pretrained=None,
+                 pretrained2d=True,
+                 patch_size=(4,4,4),
+                 in_chans=3,
+                 embed_dim=96,
+                 depths=[2, 2, 6, 2],
+                 num_heads=[3, 6, 12, 24],
+                 window_size=(2,7,7),
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop_rate=0.,
+                 attn_drop_rate=0.,
+                 drop_path_rate=0.2,
+                 norm_layer=nn.LayerNorm,
+                 patch_norm=False,
+                 frozen_stages=-1,
+                 use_checkpoint=False):
+        super().__init__()
 
+        self.pretrained = pretrained
+        self.pretrained2d = pretrained2d
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.patch_norm = patch_norm
+        self.frozen_stages = frozen_stages
+        self.window_size = window_size
+        self.patch_size = patch_size
 
-class FNO3d(FNO):
-    """3D Fourier Neural Operator
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed3D(
+            patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
 
-    For the full list of parameters, see :class:`neuralop.models.FNO`.
+        self.pos_drop = nn.Dropout(p=drop_rate)
 
-    Parameters
-    ----------
-    modes_width : int
-        number of modes to keep in Fourier Layer, along the width
-    modes_height : int
-        number of Fourier modes to keep along the height
-    modes_depth : int
-        number of Fourier modes to keep along the depth
-    """
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
-    def __init__(
-        self,
-        n_modes_height,
-        n_modes_width,
-        n_modes_depth,
-        hidden_channels,
-        in_channels=3,
-        out_channels=1,
-        lifting_channels=256,
-        projection_channels=256,
-        n_layers=4,
-        resolution_scaling_factor=None,
-        max_n_modes=None,
-        non_linearity=F.gelu,
-        stabilizer=None,
-        complex_data=False,
-        fno_block_precision="full",
-        channel_mlp_dropout=0,
-        channel_mlp_expansion=0.5,
-        norm=None,
-        skip="soft-gating",
-        separable=False,
-        preactivation=False,
-        factorization=None,
-        rank=1.0,
-        fixed_rank_modes=False,
-        implementation="factorized",
-        decomposition_kwargs=dict(),
-        domain_padding=None,
-        domain_padding_mode="one-sided",
-        **kwargs
-    ):
-        super().__init__(
-            n_modes=(n_modes_height, n_modes_width, n_modes_depth),
-            hidden_channels=hidden_channels,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            lifting_channels=lifting_channels,
-            projection_channels=projection_channels,
-            n_layers=n_layers,
-            resolution_scaling_factor=resolution_scaling_factor,
-            non_linearity=non_linearity,
-            stabilizer=stabilizer,
-            complex_data=complex_data,
-            fno_block_precision=fno_block_precision,
-            max_n_modes=max_n_modes,
-            channel_mlp_dropout=channel_mlp_dropout,
-            channel_mlp_expansion=channel_mlp_expansion,
-            norm=norm,
-            skip=skip,
-            separable=separable,
-            preactivation=preactivation,
-            factorization=factorization,
-            rank=rank,
-            fixed_rank_modes=fixed_rank_modes,
-            implementation=implementation,
-            decomposition_kwargs=decomposition_kwargs,
-            domain_padding=domain_padding,
-            domain_padding_mode=domain_padding_mode,
-        )
-        self.n_modes_height = n_modes_height
-        self.n_modes_width = n_modes_width
-        self.n_modes_depth = n_modes_depth
+        # build layers
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = BasicLayer(
+                dim=int(embed_dim * 2**i_layer),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=window_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=PatchMerging if i_layer<self.num_layers-1 else None,
+                use_checkpoint=use_checkpoint)
+            self.layers.append(layer)
+
+        self.num_features = int(embed_dim * 2**(self.num_layers-1))
+
+        # add a norm layer for each output
+        self.norm = norm_layer(self.num_features)
+
+        self.resize_linear = nn.Linear(2048, 64 * 64)
+        
+        self._freeze_stages()
+
+    def _freeze_stages(self):
+        if self.frozen_stages >= 0:
+            self.patch_embed.eval()
+            for param in self.patch_embed.parameters():
+                param.requires_grad = False
+
+        if self.frozen_stages >= 1:
+            self.pos_drop.eval()
+            for i in range(0, self.frozen_stages):
+                m = self.layers[i]
+                m.eval()
+                for param in m.parameters():
+                    param.requires_grad = False
+
+    def inflate_weights(self, logger):
+        """Inflate the swin2d parameters to swin3d.
+
+        The differences between swin3d and swin2d mainly lie in an extra
+        axis. To utilize the pretrained parameters in 2d model,
+        the weight of swin2d models should be inflated to fit in the shapes of
+        the 3d counterpart.
+
+        Args:
+            logger (logging.Logger): The logger used to print
+                debugging infomation.
+        """
+        checkpoint = torch.load(self.pretrained, map_location='cpu')
+        state_dict = checkpoint['model']
+
+        # delete relative_position_index since we always re-init it
+        relative_position_index_keys = [k for k in state_dict.keys() if "relative_position_index" in k]
+        for k in relative_position_index_keys:
+            del state_dict[k]
+
+        # delete attn_mask since we always re-init it
+        attn_mask_keys = [k for k in state_dict.keys() if "attn_mask" in k]
+        for k in attn_mask_keys:
+            del state_dict[k]
+
+        state_dict['patch_embed.proj.weight'] = state_dict['patch_embed.proj.weight'].unsqueeze(2).repeat(1,1,self.patch_size[0],1,1) / self.patch_size[0]
+
+        # bicubic interpolate relative_position_bias_table if not match
+        relative_position_bias_table_keys = [k for k in state_dict.keys() if "relative_position_bias_table" in k]
+        for k in relative_position_bias_table_keys:
+            relative_position_bias_table_pretrained = state_dict[k]
+            relative_position_bias_table_current = self.state_dict()[k]
+            L1, nH1 = relative_position_bias_table_pretrained.size()
+            L2, nH2 = relative_position_bias_table_current.size()
+            L2 = (2*self.window_size[1]-1) * (2*self.window_size[2]-1)
+            wd = self.window_size[0]
+            if nH1 != nH2:
+                logger.warning(f"Error in loading {k}, passing")
+            else:
+                if L1 != L2:
+                    S1 = int(L1 ** 0.5)
+                    relative_position_bias_table_pretrained_resized = torch.nn.functional.interpolate(
+                        relative_position_bias_table_pretrained.permute(1, 0).view(1, nH1, S1, S1), size=(2*self.window_size[1]-1, 2*self.window_size[2]-1),
+                        mode='bicubic')
+                    relative_position_bias_table_pretrained = relative_position_bias_table_pretrained_resized.view(nH2, L2).permute(1, 0)
+            state_dict[k] = relative_position_bias_table_pretrained.repeat(2*wd-1,1)
+
+        msg = self.load_state_dict(state_dict, strict=False)
+        logger.info(msg)
+        logger.info(f"=> loaded successfully '{self.pretrained}'")
+        del checkpoint
+        torch.cuda.empty_cache()
+
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
+
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+        def _init_weights(m):
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=.02)
+                if isinstance(m, nn.Linear) and m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+
+        if pretrained:
+            self.pretrained = pretrained
+        if isinstance(self.pretrained, str):
+            self.apply(_init_weights)
+            logger = get_root_logger()
+            logger.info(f'load model from: {self.pretrained}')
+
+            if self.pretrained2d:
+                # Inflate 2D model into 3D model.
+                self.inflate_weights(logger)
+            else:
+                # Directly load 3D model.
+                load_checkpoint(self, self.pretrained, strict=False, logger=logger)
+        elif self.pretrained is None:
+            self.apply(_init_weights)
+        else:
+            raise TypeError('pretrained must be a str or None')
+
+    def forward(self, x):
+        """Forward function."""
+        x = self.patch_embed(x)
+        
+        x = self.pos_drop(x)
+
+        for layer in self.layers:
+            x = layer(x.contiguous())
+
+        x = rearrange(x, 'n c d h w -> n d h w c')
+        x = self.norm(x)
+        x = einops.reduce(x, 'n d h w c -> n h w c', "sum")
+        x = rearrange(x, 'n h w c -> n (h w c)')
+        x = self.resize_linear(x)
+        x = rearrange(x, 'n (h w c) -> n c h w', h = 64, w = 64, c = 1)
+
+        return x
+
+    def train(self, mode=True):
+        """Convert the model into training mode while keep layers freezed."""
+        super(OpFormer, self).train(mode)
+        self._freeze_stages()
