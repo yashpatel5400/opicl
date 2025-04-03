@@ -1,5 +1,7 @@
 import numpy as np
 from numpy.fft import fftn, ifftn
+import torch
+from torch.utils.data import Dataset
 
 ################################################
 # 1) Build the diagonal covariance matrix Sigma
@@ -168,12 +170,16 @@ def GRF(alpha, beta, gamma, N):
 ################################################
 # 6) Main demonstration
 ################################################
-def main():
+def sample_random_operator(N=64, K=8, num_samples=1000):
+    """
+    Generate num_samples random operator samples in a vectorized manner.
+    Returns a list of tuples (f_spatial, Of_spatial, alpha2D).
+    N:         # spatial discretization of [0, 2pi)
+    K:         # truncated frequencies from -2..2
+    """
     # Parameters
-    K = 2         # truncated frequencies from -2..2
     sigma_gauss = 0.5
-    N = 16        # grid for the GRF
-
+    
     alpha = 1.0
     beta  = 1.0
     gamma = 4.0
@@ -182,50 +188,94 @@ def main():
     # (A) Build diagonal covariance matrix, Sigma
     # --------------------------------
     Sigma = build_operator_covariance_matrix(K, sigma_gauss)
-    print("Sigma shape:", Sigma.shape, "(should be ( (2K+1)^2*(2K+1)^2, ...))")
-
-    # --------------------------------
-    # (B) Sample operator coefficients alpha_{(j,i)}
-    # --------------------------------
-    alpha2D = sample_operator_coeffs(Sigma, K)
-    # alpha2D: shape (side^2, side^2).
-
-    # --------------------------------
-    # (C) Generate a random function f using the GRF function
-    #     Then get its truncated Fourier coefficients fHat2D
-    # --------------------------------
-    fHat2D = build_random_function_hat(alpha, beta, gamma, N, K)
     side = 2*K + 1
-    print("fHat2D shape:", fHat2D.shape, "(should be (side, side))")
 
     # --------------------------------
-    # (D) Apply O to f in freq domain
+    # (B) Sample operator coefficients alpha_{(j,i)} for all samples at once
     # --------------------------------
-    Of2D = apply_operator(alpha2D, fHat2D)
+    # Generate random numbers for all samples at once
+    big_size = side**2 * side**2
+    z = np.random.randn(num_samples, big_size)
+    diagVals = np.diag(Sigma)
+    alpha_vecs = np.sqrt(diagVals) * z  # shape (num_samples, big_size)
+    alpha2Ds = alpha_vecs.reshape(num_samples, side**2, side**2)
 
-    # Inverse FFT to get O(f)(y) in real space
-    # We'll put Of2D back onto an NxN grid. We do the same
-    # "wrap-around" indexing as build_random_function_hat:
-    O_F_full = np.zeros((N,N), dtype=complex)
-
+    # --------------------------------
+    # (C) Generate random functions f using GRF for all samples at once
+    # --------------------------------
+    # Generate random fields in frequency space for all samples
+    xi = np.random.randn(num_samples, N, N)
+    K1, K2 = np.meshgrid(np.arange(N), np.arange(N), indexing='ij')
+    freq_sq = (K1**2 + K2**2)
+    coef = alpha**0.5 * (4*np.pi**2 * freq_sq + beta)**(-gamma/2)
+    L = N * coef * xi
+    # enforce mean 0 for all samples
+    L[:, 0, 0] = 0
+    
+    # Convert to real space for all samples
+    f_real = np.real(ifftn(L, norm='forward', axes=(-2, -1)))
+    
+    # Get truncated Fourier coefficients for all samples
+    F = fftn(f_real, norm='forward', axes=(-2, -1))
+    
+    # Create frequency indices for all samples
     rowvals = np.arange(-K, K+1)
     colvals = np.arange(-K, K+1)
-    # building a small mesh
     R, C = np.meshgrid(rowvals, colvals, indexing='ij')
+    Rmod = R % N
+    Cmod = C % N
+    
+    # Extract the block of frequencies for all samples
+    fHat2Ds = F[:, Rmod, Cmod]  # shape (num_samples, side, side)
 
-    def wrap_index(idx):
-        return idx % N
+    # --------------------------------
+    # (D) Apply operators to all samples at once
+    # --------------------------------
+    # Reshape fHat2Ds for matrix multiplication
+    f_vecs = fHat2Ds.reshape(num_samples, side**2)
+    
+    # Apply operators using einsum for efficient batch matrix multiplication
+    Of_vecs = np.einsum('nij,nj->ni', alpha2Ds, f_vecs)
+    Of2Ds = Of_vecs.reshape(num_samples, side, side)
 
-    Rmod = wrap_index(R)
-    Cmod = wrap_index(C)
-    # place Of2D into the big freq array
-    O_F_full[Rmod, Cmod] = Of2D
+    # --------------------------------
+    # (E) Convert to real space for all samples
+    # --------------------------------
+    # Create full frequency arrays for all samples
+    O_F_full = np.zeros((num_samples, N, N), dtype=complex)
+    O_F_full[:, Rmod, Cmod] = Of2Ds
+    
+    # Convert to real space
+    Of_spatials = np.real(ifftn(O_F_full, norm='forward', axes=(-2, -1)))
+    
+    # Get f in real space for all samples
+    f_full = np.zeros((num_samples, N, N), dtype=complex)
+    f_full[:, Rmod, Cmod] = fHat2Ds
+    f_spatials = np.real(ifftn(f_full, norm='forward', axes=(-2, -1)))
+    
+    # Return list of tuples
+    return f_spatials, Of_spatials
 
-    # iFFT to get real space
-    Of_spatial = ifftn(O_F_full, norm='forward')
-    print("Of_spatial shape:", Of_spatial.shape)
-    print("Of_spatial (real part) sample:\n", np.real(Of_spatial)[:5,:5])
+
+def get_spatial_coordinates(N):
+    """
+    Generate x,y coordinates for spatial discretization over [0,2π)².
+    
+    Args:
+        N (int): Number of grid points in each dimension
+        
+    Returns:
+        tuple: (x_coords, y_coords) where each is a 2D array of shape (N,N)
+               containing the x and y coordinates respectively
+    """
+    # Create evenly spaced points from 0 to 2π (exclusive)
+    points = np.linspace(0, 2*np.pi, N, endpoint=False)
+    
+    # Create 2D coordinate grids
+    x_coords, y_coords = np.meshgrid(points, points, indexing='ij')
+    
+    return x_coords, y_coords
 
 
 if __name__ == "__main__":
-    main()
+    sample_random_operator()
