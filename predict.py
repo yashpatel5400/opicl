@@ -29,8 +29,6 @@ exp_dict = {
     'patch_size': [16],
     'modes': [[8,8]],
     'im_size': [64],
-    'smoothing': [False],
-    'smoothing_modes': [64],
     'd_model': [32,64,96],
     'nhead': [8],
     'num_layers': [6],
@@ -47,8 +45,6 @@ model_hyperparams = {
     'patch_size': exp_dict["patch_size"],
     'modes': exp_dict["modes"],
     'im_size': exp_dict["im_size"],
-    'smoothing': exp_dict["smoothing"],
-    'smoothing_modes': exp_dict["smoothing_modes"],
     'd_model': exp_dict["d_model"],
     'nhead': exp_dict["nhead"],
     'num_layers': exp_dict["num_layers"],
@@ -59,8 +55,6 @@ model_hyperparams = {
 }
 model_hyperparams = {key : value[0] for key, value in model_hyperparams.items()}
 
-# generate data
-N = 64
 samples = sample_random_operator(N=model_hyperparams["im_size"])
 fs, Ofs = samples
 
@@ -68,10 +62,12 @@ coords_f_x, coords_f_y = get_spatial_coordinates(fs.shape[1])
 coords_f = np.array([coords_f_x, coords_f_y])
 
 device = "cuda:0"
-f_pt = torch.from_numpy(fs[0]).to(device)
-coords_f_pt = torch.from_numpy(coords_f).to(device)
 
-# predict with model
+T = 5
+f_pt = torch.from_numpy(fs[0:T]).unsqueeze(0).to(device).to(torch.float32)
+coords_f_pt = torch.from_numpy(coords_f).to(device).to(torch.float32)
+
 fano = FANO(**model_hyperparams).to(device)
 with torch.no_grad():
-    Of_pred = fano(f_pt.unsqueeze(0), coords_x=coords_f_pt.unsqueeze(0))
+    Of_pred = fano(f_pt, coords_f_pt) # B x H x W x 1
+    print(Of_pred.shape)
