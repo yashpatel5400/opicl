@@ -62,19 +62,23 @@ class MultiheadAttentionOperator(nn.Module):
         self.d_k = d_model // nhead
         self.im_size = im_size
 
-        self.query_operator = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
-        self.key_operator   = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
-        self.value_operator = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
+        self.query_operator   = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
+        self.key_operator     = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
+        self.value_operator_x = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
+        self.value_operator_y = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
 
         self.scaled_dot_product_attention = ScaledDotProductAttention_Operator(im_size)
 
     def forward(self, z, key_padding_mask=None):
-        batch, T, full_H, W, _ = z.size() # N x T x 2H x W x C
-        x = z[:,:,:full_H // 2] # z = [x ; y] (stacked vertically) -> N x T x H x W x C
+        batch, T, full_H, W, _ = z.size()               # z    : N x T x 2H x W x C
+        x, y = z[:,:,:full_H // 2], z[:,:,full_H // 2:] # x, y : N x T x  H x W x C
         
         query = self.query_operator(x).permute(0,5,1,2,3,4)
         key   = self.key_operator(x).permute(0,5,1,2,3,4)
-        value = self.value_operator(z).permute(0,5,1,2,3,4)
+
+        value_x = self.value_operator_x(x).permute(0,5,1,2,3,4)
+        value_y = self.value_operator_y(y).permute(0,5,1,2,3,4)
+        value   = torch.cat([value_x, value_y], dim=3)
 
         output = self.scaled_dot_product_attention(query, key, value, key_padding_mask=key_padding_mask)
         output = output.reshape(batch, T, full_H, W,-1)
@@ -121,8 +125,8 @@ class TransformerOperator(nn.Module):
         coords_stack = coords_stack.unsqueeze(0).unsqueeze(1)     # 1 x 1 x 2H x W x 2
         coords_stack = coords_stack.repeat(B, T, 1, 1, 1)         # B x T x 2H x W x 2
 
-        z = z.unsqueeze(-1)                         # B x T x H x W x 1
-        z_tf = torch.cat((z, coords_stack), dim=-1) # B x T x 2H x W x 3
+        z = z.unsqueeze(-1)                      # B x T x H x W x 1
+        z = torch.cat((z, coords_stack), dim=-1) # B x T x 2H x W x 3
         for layer in self.layers:
-            z_tf = layer(z_tf, mask=mask)           # B x T x 2H x W x d
-        return z[:,-1,H//2:] # B x 1 x H x W x 1 -- bottom right is prediction
+            z = layer(z, mask=mask) # B x T x 2H x W x 3
+        return z[:,-1,H//2:,:,0]    # B x 1 x H x W x 1 -- bottom right is prediction (in first channel)
