@@ -177,9 +177,9 @@ def sample_random_operator(N=64, K=8, num_samples=1000):
     N:         # spatial discretization of [0, 2pi)
     K:         # truncated frequencies from -2..2
     """
-    # Parameters
-    sigma_gauss = 0.5
+    sigma_gauss = 0.5 # parameter for Gaussian kernel k_y
     
+    # parameters for sampling of random functions
     alpha = 1.0
     beta  = 1.0
     gamma = 4.0
