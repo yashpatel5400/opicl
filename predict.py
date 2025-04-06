@@ -2,7 +2,7 @@ from dataset import sample_random_operator, get_spatial_coordinates
 import numpy as np
 
 import torch
-from transformer_custom import TransformerOperator
+from opformer import TransformerOperator
 
 num_layers = 6
 im_size    = [128, 64]
