@@ -21,7 +21,8 @@ T = 5
 Z_pt = torch.from_numpy(Z[0:T]).unsqueeze(0).to(device).to(torch.float32)
 coords_pt = torch.from_numpy(coords).to(device).to(torch.float32)
 
-opformer = TransformerOperator(num_layers=num_layers, im_size=im_size).to(device)
-with torch.no_grad():
-    Of_pred = opformer(Z_pt, coords_pt) # B x H x W x 1
-    print(Of_pred.shape)
+y_test = Z_pt[:,-1,im_size[0]//2:].clone()
+Z_pt[:,-1,im_size[0]//2:] = 0
+
+opformer  = TransformerOperator(num_layers=num_layers, im_size=im_size).to(device)
+y_hat_icl = opformer(Z_pt, coords_pt)

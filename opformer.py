@@ -41,22 +41,34 @@ class SpectralConv2d_Attention(nn.Module):
         return x
 
 
-def gaussian_2d_kernel(size, sigma, device):
+def apply_spatial_gaussian_conv(value, kernel):
     """
-    Build a 2D Gaussian kernel tensor of shape (size, size).
-    This is for k_y(y,y') = exp(-||y - y'||^2 / (2 sigma^2))
-    in discrete form on a (size x size) grid.
+    value: (B, nH, T, H, W, d)
+    kernel: (1, 1, 1, Hk, Wk)
+    Returns: value_convolved, same shape as value
     """
-    x_coords = torch.arange(size[1], device=device)
-    y_coords = torch.arange(size[0], device=device)
-    grid_x, grid_y = torch.meshgrid(x_coords, y_coords, indexing='ij')
-    # center them for (size x size) if needed
-    center = (np.array(size) - 1) / 2.0
-    dist_sq = (grid_x - center[1])**2 + (grid_y - center[0])**2
-    kernel_2d = torch.exp(-0.5 * dist_sq / (sigma**2))
-    # you might or might not normalize:
-    kernel_2d = kernel_2d / kernel_2d.sum()
-    return kernel_2d
+    B, nH, T, H, W, d = value.shape
+    value = value.permute(0, 1, 5, 2, 3, 4).reshape(B * nH * d * T, 1, H, W)
+    
+    # Apply Gaussian convolution via groups
+    value_conv = F.conv2d(value, kernel, padding='same')
+    
+    # Reshape back
+    value_conv = value_conv.reshape(B, nH, d, T, H, W).permute(0, 1, 3, 4, 5, 2)
+    return value_conv  # (B, nH, T, H, W, d)
+
+
+def make_gaussian_kernel(sigma, size):
+    H, W = size
+    y = torch.arange(H, dtype=torch.float32)
+    x = torch.arange(W, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    center_y = (H - 1) / 2
+    center_x = (W - 1) / 2
+    kernel = torch.exp(-((xx - center_x)**2 + (yy - center_y)**2) / (2 * sigma**2))
+    kernel = kernel / kernel.sum()
+    return kernel.view(1, 1, H, W)  # Shape for depthwise conv2d
+
 
 
 class ScaledDotProductAttention_Operator(nn.Module):
@@ -68,50 +80,21 @@ class ScaledDotProductAttention_Operator(nn.Module):
             torch.sqrt(torch.tensor(float(im_size[0] * im_size[1]) ** 2, dtype=torch.float32)),
             requires_grad=False
         )
-        self.gaussian_kernel_2d = gaussian_2d_kernel(
-            size=im_size, sigma=sigma, device='cpu'  # later move to GPU if needed
-        )
-
-    def kernel_fn(self, query, key):
-        """
-        Operator-valued kernel:
-          k_x = linear dot product over (H,W,C),
-          k_y = 2D Gaussian in (H,W).
-        Returns shape [B, nhead, T, T, H, W].
-        """
-        B, nH, T, H, W, C = query.shape
-
-        # 1) linear kernel in input space, i.e. dot product across channels,H,W
-        q_ = query.reshape(B, nH, T, -1)  # (B,nH,T, H*W*C)
-        k_ = key.reshape(B, nH, T, -1)    # same shape
+        self.kernel = make_gaussian_kernel(sigma=sigma, size=self.im_size)
         
-        q_m = q_.permute(0,1,2,3)      # (B,nH,T,d)
-        k_m = k_.permute(0,1,3,2)      # (B,nH,d,T)
-        dot_2d = torch.matmul(q_m, k_m) / self.scale  # (B,nH,T,T), scaled
-        # dot_2d is the "k_x" part => shape (B,nH,T,T).
-
-        # 2) Now we want to multiply that scalar by a 2D Gaussian kernel on Y => shape (H,W).
-        #    So for each pair (t1,t2), we produce a 2D field. That yields shape (B,nH,T,T,H,W).
-        #    We'll broadcast multiply dot_2d[...,t1,t2] * gaussian(y).
-        #    Let gauss_2d: shape (H,W).
-        gauss_2d = self.gaussian_kernel_2d.to(query.device)  # shape (2H,W)
-        dot_2d_ = dot_2d.unsqueeze(-1).unsqueeze(-1)         # (B,nH,T,T,1,1)
-        operator_val = dot_2d_ * gauss_2d                    # => (B,nH,T,T,2H,W)
-
-        return operator_val
 
     def forward(self, query, key, value, key_padding_mask=None):
-        # attention_weights is now shape (B,nhead,T,T,2H,W)
-        attention_weights = self.kernel_fn(query, key)
+        B, nH, T, H, W, C = query.shape
 
-        B, nH, T, _, H0, W0 = attention_weights.shape
-        # flatten the (H0,W0) for a batched matmul:
-        attn_2d = attention_weights.view(B,nH,T,T, H0*W0)
-        val_2d  = value.view(B,nH,T, H0*W0, -1)
-        # do a double contraction: T, H0*W0
-        out_2d = torch.einsum("b n p q m, b n q m d -> b n p m d", attn_2d, val_2d) # Now out_2d has shape (B,nH,T,H0*W0,d)
-        out_2d = out_2d.view(B, nH, T, self.im_size[0], self.im_size[1], -1)     # Reshape to (B,nH,T,H0,W0,d):
-        return out_2d
+        # Compute k_x similarity
+        q_ = query.reshape(B, nH, T, -1)
+        k_ = key.reshape(B, nH, T, -1)
+        kx = torch.matmul(q_, k_.transpose(-1, -2)) / self.scale  # (B, nH, T, T)
+
+        # Apply convolution in spatial domain to each value
+        value_convolved = apply_spatial_gaussian_conv(value, self.kernel)  # (B,nH,T,H,W,d)
+        output = torch.einsum("b n p q, b n q h w d -> b n p h w d", kx, value_convolved)
+        return output
 
 
 class MultiheadAttentionOperator(nn.Module):
