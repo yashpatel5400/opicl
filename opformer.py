@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 
+device = "cuda"
 
 class SpectralConv2d_Attention(nn.Module):
     def __init__(self, in_channels, out_channels, modes1, modes2, nhead):
@@ -67,8 +68,7 @@ def make_gaussian_kernel(sigma, size):
     center_x = (W - 1) / 2
     kernel = torch.exp(-((xx - center_x)**2 + (yy - center_y)**2) / (2 * sigma**2))
     kernel = kernel / kernel.sum()
-    return kernel.view(1, 1, H, W)  # Shape for depthwise conv2d
-
+    return kernel.view(1, 1, H, W).to(device)  # Shape for depthwise conv2d
 
 
 class ScaledDotProductAttention_Operator(nn.Module):
@@ -98,7 +98,7 @@ class ScaledDotProductAttention_Operator(nn.Module):
 
 
 class MultiheadAttentionOperator(nn.Module):
-    def __init__(self, d_model, nhead, modes1, modes2, im_size):
+    def __init__(self, d_model, nhead, modes1, modes2, im_size, sigma=5.0):
         super(MultiheadAttentionOperator, self).__init__()
         self.nhead = nhead
         self.d_k = d_model // nhead
@@ -109,7 +109,7 @@ class MultiheadAttentionOperator(nn.Module):
         self.value_operator_x = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
         self.value_operator_y = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2, nhead)
 
-        self.scaled_dot_product_attention = ScaledDotProductAttention_Operator(im_size)
+        self.scaled_dot_product_attention = ScaledDotProductAttention_Operator(im_size, sigma=sigma)
 
     def forward(self, z, key_padding_mask=None):
         batch, T, full_H, W, _ = z.size()               # z    : N x T x 2H x W x C
@@ -127,8 +127,21 @@ class MultiheadAttentionOperator(nn.Module):
         return output
 
 
+def init_spectral_identity_weights(layer, modes1, modes2, scale=1.0):
+    in_channels = layer.in_channels
+    out_channels = layer.out_channels
+    nhead = layer.nhead
+
+    weight = torch.zeros(in_channels, out_channels, modes1, modes2, nhead, dtype=torch.cfloat)
+    for i in range(min(in_channels, out_channels)):
+        weight[i, i, :, :, :] = scale
+
+    layer.weights1.data = weight.clone()
+    layer.weights2.data = weight.clone()
+
+
 class TransformerOperatorLayer(nn.Module):#
-    def __init__(self, d_model, nhead, patch_size=1, im_size=64):
+    def __init__(self, d_model, nhead, patch_size=1, im_size=64, icl_init=False, r_l=None, sigma=5.0):
         super(TransformerOperatorLayer, self).__init__()
         
         modes1 = patch_size // 2 + 1
@@ -140,7 +153,13 @@ class TransformerOperatorLayer(nn.Module):#
         self.size_col   = im_size
         self.d_model    = d_model
 
-        self.self_attn = MultiheadAttentionOperator(d_model, nhead, modes1, modes2, im_size)
+        self.self_attn = MultiheadAttentionOperator(d_model, nhead, modes1, modes2, im_size, sigma=sigma)
+        
+        if icl_init:
+            init_spectral_identity_weights(self.self_attn.query_operator,   modes1, modes2, scale=1.0)
+            init_spectral_identity_weights(self.self_attn.key_operator,     modes1, modes2, scale=1.0)
+            init_spectral_identity_weights(self.self_attn.value_operator_x, modes1, modes2, scale=0.0)
+            init_spectral_identity_weights(self.self_attn.value_operator_y, modes1, modes2, scale=r_l)
 
     def forward(self, z, mask=None):
         attn_output = self.self_attn(z, key_padding_mask=mask)
@@ -149,15 +168,23 @@ class TransformerOperatorLayer(nn.Module):#
 
 
 class TransformerOperator(nn.Module):
-    def __init__(self, num_layers, im_size):
+    def __init__(self, num_layers, im_size, icl_init=False, sigma=5.0):
         super(TransformerOperator, self).__init__()
         patch_size = im_size[1]
-        transformer_layer = TransformerOperatorLayer(
-            d_model=3, # assumed scalar field concatenated with coords (1 + 2)
-            nhead=1,   # TODO: may want to extend theory to MHA in the future
-            patch_size=patch_size,
-            im_size=im_size)
-        self.layers = nn.ModuleList([copy.deepcopy(transformer_layer) for _ in range(num_layers)])
+
+        transformer_layers = []
+        for l in range(num_layers):
+            transformer_layers.append(TransformerOperatorLayer(
+                d_model=3, # assumed scalar field concatenated with coords (1 + 2)
+                nhead=1,   # TODO: may want to extend theory to MHA in the future
+                patch_size=patch_size,
+                im_size=im_size,
+                icl_init=icl_init,
+                r_l=1e-3, # step size for in-context learning gradient descent
+                sigma=sigma, 
+            ))
+
+        self.layers = nn.ModuleList(transformer_layers)
 
     def forward(self, z, coords, mask=None): 
         # z : B x T x 2H x W; coords: 2 x 2H x W 

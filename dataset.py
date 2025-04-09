@@ -170,15 +170,13 @@ def GRF(alpha, beta, gamma, N):
 ################################################
 # 6) Main demonstration
 ################################################
-def sample_random_operator(N=64, K=8, num_samples=1000):
+def sample_random_operator(N=64, K=8, num_samples=1000, sigma_gauss=0.5):
     """
     Generate num_samples random operator samples in a vectorized manner.
     Returns a list of tuples (f_spatial, Of_spatial, alpha2D).
     N:         # spatial discretization of [0, 2pi)
     K:         # truncated frequencies from -2..2
     """
-    sigma_gauss = 0.5 # parameter for Gaussian kernel k_y
-    
     # parameters for sampling of random functions
     alpha = 1.0
     beta  = 1.0
@@ -275,7 +273,3 @@ def get_spatial_coordinates(N):
     x_coords, y_coords = np.meshgrid(points, points, indexing='ij')
     
     return x_coords, y_coords
-
-
-if __name__ == "__main__":
-    sample_random_operator()
