@@ -170,7 +170,7 @@ def GRF(alpha, beta, gamma, N):
 ################################################
 # 6) Main demonstration
 ################################################
-def sample_random_operator(N=64, K=8, num_samples=1000, sigma_gauss=0.5):
+def sample_random_operator(N=64, K=8, num_samples=1000, sigma_gauss=1.0):
     """
     Generate num_samples random operator samples in a vectorized manner.
     Returns a list of tuples (f_spatial, Of_spatial, alpha2D).
