@@ -21,7 +21,7 @@ def set_seed(seed_value=42):
 
 set_seed()
 num_layers = 6
-im_size    = [128, 64]
+im_size    = [64, 64]
 
 samples = sample_random_operator(N=im_size[-1], sigma_gauss=5.0) # size is 2 w x w (since Z is stack of x y)
 fs, Ofs = samples
@@ -33,12 +33,12 @@ Z      = np.concatenate([fs, Ofs], axis=1)
 coords = np.concatenate([coords_f, coords_f], axis=1)
 
 device = "cuda"
-T = 5
+T = 2
 Z_pt = torch.from_numpy(Z[0:T]).unsqueeze(0).to(device).to(torch.float32)
 coords_pt = torch.from_numpy(coords).to(device).to(torch.float32)
 
-y_test = Z_pt[:,-1,im_size[0]//2:].clone().cpu().numpy()
-Z_pt[:,-1,im_size[0]//2:] = 0
+y_test = Z_pt[:,-1,im_size[0]:].clone().cpu().numpy()
+Z_pt[:,-1,im_size[0]:] = 0
 
 layer_trials       = list(range(25, 50, 5))
 errors_matching    = []
