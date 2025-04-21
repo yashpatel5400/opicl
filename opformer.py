@@ -110,6 +110,11 @@ class ScaledDotProductAttention_Operator(nn.Module):
         k_ = key.reshape(B, nH, T, -1)
         kx = torch.matmul(q_, k_.transpose(-1, -2)) / self.scale  # (B, nH, T, T)
 
+        np.save("q.npy", q_.cpu().detach().numpy())
+        np.save("k.npy", k_.cpu().detach().numpy())
+
+        print(kx)
+
         # Apply convolution in spatial domain to each value
         value_convolved = apply_spatial_gaussian_conv(value, self.kernel)  # (B,nH,T,H,W,d)
         output = torch.einsum("b n p q, b n q h w d -> b n p h w d", kx, value_convolved)
@@ -138,10 +143,6 @@ class MultiheadAttentionOperator(nn.Module):
         
         query = self.query_operator(x).permute(0,5,1,2,3,4)
         key   = self.key_operator(x).permute(0,5,1,2,3,4)
-
-        # value_x = self.value_operator_x(x).permute(0,5,1,2,3,4)
-        # value_y = self.value_operator_y(y).permute(0,5,1,2,3,4)
-        # value   = torch.cat([value_x, value_y], dim=3)
 
         # NOTE: this assumes as in the paper that the value operator is 0'd out -- it is equivalent to
         # using the more general masking approach, but the dimension matching is slightly easier this way
