@@ -110,11 +110,6 @@ class ScaledDotProductAttention_Operator(nn.Module):
         k_ = key.reshape(B, nH, T, -1)
         kx = torch.matmul(q_, k_.transpose(-1, -2)) / self.scale  # (B, nH, T, T)
 
-        np.save("q.npy", q_.cpu().detach().numpy())
-        np.save("k.npy", k_.cpu().detach().numpy())
-
-        print(kx)
-
         # Apply convolution in spatial domain to each value
         value_convolved = apply_spatial_gaussian_conv(value, self.kernel)  # (B,nH,T,H,W,d)
         output = torch.einsum("b n p q, b n q h w d -> b n p h w d", kx, value_convolved)
@@ -189,7 +184,13 @@ class TransformerOperatorLayer(nn.Module):#
             init_spectral_identity_weights(self.self_attn.value_operator_y, modes1, modes2, scale=r_l)
 
     def forward(self, z, mask=None):
-        attn_output = self.self_attn(z, key_padding_mask=mask)
+        attn_output = self.self_attn(z, key_padding_mask=mask) # N x T x 2H x W x C
+        
+        # HACK: hard-coded masking
+        N, T, full_H, W, C = attn_output.shape
+        attn_output[:,:T-1] = 0
+        attn_output[:,T-1,:full_H//2] = 0
+
         z = z + attn_output
         return z
 
@@ -207,7 +208,7 @@ class TransformerOperator(nn.Module):
                 patch_size=patch_size,
                 im_size=im_size,
                 icl_init=icl_init,
-                r_l=1e-2, # step size for in-context learning gradient descent
+                r_l=1e-1, # step size for in-context learning gradient descent
                 sigma=sigma, 
             ))
 
@@ -225,6 +226,8 @@ class TransformerOperator(nn.Module):
             coords_stack = coords_stack.repeat(B, T, 1, 1, 1)         # B x T x 2H x W x 2
             z = torch.cat((z, coords_stack), dim=-1) # B x T x 2H x W x 3
 
+        zs = []
         for layer in self.layers:
             z = layer(z, mask=mask) # B x T x 2H x W x 3
-        return z[:,-1,H//2:,:,0]    # B x 1 x H x W x 1 -- bottom right is prediction (in first channel)
+            zs.append(z[:,-1,H//2:,:,0].cpu().detach().numpy())
+        return z[:,-1,H//2:,:,0], zs    # B x 1 x H x W x 1 -- bottom right is prediction (in first channel)
