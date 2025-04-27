@@ -75,44 +75,83 @@ def apply_spatial_conv(value, kernel):
             kernel,  # [1, 1, kh, kw]
             padding=0,
         ))
-    return torch.stack(value_convs).reshape(B, d, T, H, W).permute(0, 2, 3, 4, 1)  # (B, T, H, W, d)
+    return torch.stack(value_convs).squeeze().unsqueeze(0).unsqueeze(-1)  # (B, T, H, W, d)
 
 
 class ScaledDotProductAttention_Operator(nn.Module):
-    def __init__(self, im_size, kernel):
+    def __init__(self, im_size, ky_kernel, kx_name='linear', kx_sigma=1.0):
         super(ScaledDotProductAttention_Operator, self).__init__()
         self.im_size = im_size
-        # Build or store needed objects (like above)
         self.scale = nn.Parameter(
             torch.sqrt(torch.tensor(float(im_size[0] * im_size[1]) ** 2, dtype=torch.float32)),
             requires_grad=False
         )
-        self.kernel = torch.from_numpy(kernel).unsqueeze(0).unsqueeze(0).to(torch.float32).to(device)
-        
+        self.ky_kernel = torch.from_numpy(ky_kernel).unsqueeze(0).unsqueeze(0).to(torch.float32).to(device)
+        self.kx_name = kx_name
+        self.kx_sigma = kx_sigma
+
+    def compute_kx(self, query, key):
+        B, T, H, W, C = query.shape
+        q_ = query.reshape(B, T, -1)
+        k_ = key.reshape(B, T, -1)
+
+        if self.kx_name == "linear":
+            kx = torch.matmul(q_, k_.transpose(-1, -2))
+
+        elif self.kx_name == "laplacian":
+            # L1 distance
+            q_exp = q_.unsqueeze(2)  # (B, T, 1, D)
+            k_exp = k_.unsqueeze(1)  # (B, 1, T, D)
+            l1_dist = torch.sum(torch.abs(q_exp - k_exp), dim=-1)  # (B, T, T)
+            kx = torch.exp(-l1_dist / self.kx_sigma)
+
+        elif self.kx_name == "gradient_rbf":
+            # Assume spatial gradients
+            q_grad_y = q_.reshape(B, T, H, W, C).diff(dim=2, append=q_.reshape(B, T, H, W, C)[:,:,-1:,:,:])  # simple gradient along y
+            q_grad_x = q_.reshape(B, T, H, W, C).diff(dim=3, append=q_.reshape(B, T, H, W, C)[:,:,:,-1:,:])  # simple gradient along x
+            k_grad_y = key.diff(dim=2, append=key[:,:,-1:,:,:])
+            k_grad_x = key.diff(dim=3, append=key[:,:,:,-1:,:])
+
+            qg = torch.cat([q_grad_x, q_grad_y], dim=-1).reshape(B, T, -1)
+            kg = torch.cat([k_grad_x, k_grad_y], dim=-1).reshape(B, T, -1)
+            qg_norm = (qg ** 2).sum(dim=-1, keepdim=True)
+            kg_norm = (kg ** 2).sum(dim=-1, keepdim=True)
+            dist_sq = qg_norm + kg_norm.transpose(-1, -2) - 2 * torch.matmul(qg, kg.transpose(-1, -2))
+            kx = torch.exp(-dist_sq / (2 * self.kx_sigma**2))
+
+        elif self.kx_name == "energy":
+            q_energy = (q_ ** 2).sum(dim=-1, keepdim=True)
+            k_energy = (k_ ** 2).sum(dim=-1, keepdim=True)
+            energy_diff = q_energy - k_energy.transpose(-1, -2)
+            kx = torch.exp(-(energy_diff ** 2) / (2 * self.kx_sigma**2))
+
+        else:
+            raise ValueError(f"Unsupported kx_name: {self.kx_name}")
+
+        return kx
 
     def forward(self, query, key, value):
         B, T, H, W, C = query.shape
 
         # Compute k_x similarity
-        q_ = query.reshape(B, T, -1)
-        k_ = key.reshape(B, T, -1)
-        unmasked_kx = torch.matmul(q_, k_.transpose(-1, -2)) / self.scale  # (B, T, T)
+        unmasked_kx = self.compute_kx(query, key)
 
-        M = torch.from_numpy(np.zeros((T, T))).to(torch.float32).to(query.device)
-        M[:T-1,:T-1] = torch.eye(T-1)
+        # Masking: copy from your original if needed
+        M = torch.zeros((T, T), device=query.device, dtype=torch.float32)
+        M[:T-1, :T-1] = torch.eye(T-1, device=query.device)
         kx = torch.matmul(M, unmasked_kx)
-        
-        # Apply convolution in spatial domain to each value
-        value_convolved = apply_spatial_conv(value, self.kernel)  # (B, T, H, W, C)
-        v      = value_convolved.permute(0, 2, 3, 4, 1) # (B, H, W, C, T)
-        attn   = torch.matmul(v, kx)                    # (B, H, W, C, T)
-        output = attn.permute(0, 4, 1, 2, 3)            # (B, T, H, W, C)
+
+        # Convolve value with spatial kernel
+        value_convolved = apply_spatial_conv(value, self.ky_kernel)  # (B, T, H, W, C)
+
+        v = value_convolved.permute(0, 2, 3, 4, 1)  # (B, H, W, C, T)
+        attn = torch.matmul(v, kx)                  # (B, H, W, C, T)
+        output = attn.permute(0, 4, 1, 2, 3)        # (B, T, H, W, C)
 
         return output
 
-
 class AttentionOperator(nn.Module):
-    def __init__(self, d_model, modes1, modes2, im_size, kernel, icl_lr):
+    def __init__(self, d_model, modes1, modes2, im_size, ky_kernel, icl_lr, kx_name, kx_sigma):
         super(AttentionOperator, self).__init__()
         self.d_k = d_model
         self.im_size = im_size
@@ -123,7 +162,7 @@ class AttentionOperator(nn.Module):
         self.value_operator_x = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2) 
         self.value_operator_y = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2)
 
-        self.scaled_dot_product_attention = ScaledDotProductAttention_Operator(im_size, kernel)
+        self.scaled_dot_product_attention = ScaledDotProductAttention_Operator(im_size, ky_kernel, kx_name, kx_sigma)
 
         self.icl_lr = icl_lr
 
@@ -134,14 +173,9 @@ class AttentionOperator(nn.Module):
         
         # NOTE: this assumes as in the paper that the value operator is 0'd out -- it is equivalent to
         # using the more general masking approach, but the dimension matching is slightly easier this way
-        # query = self.query_operator(x)
-        # key   = self.key_operator(x)
-        # value = self.value_operator_y(y)
-
-        # NOTE: temporarily just using the value we would get without numerical imprecision of the FFT
-        query = x.clone()
-        key   = x.clone()
-        value = self.icl_lr * y.clone()
+        query = self.query_operator(x)
+        key   = self.key_operator(x)
+        value = self.value_operator_y(y)
 
         # NOTE: following assumes attention is computed with only 1 head
         attn_y = self.scaled_dot_product_attention(query, key, value).reshape(batch, T, H, W, -1)
@@ -162,7 +196,7 @@ def init_spectral_identity_weights(layer, modes1, modes2, scale=1.0):
 
 
 class TransformerOperatorLayer(nn.Module):#
-    def __init__(self, d_model, patch_size=1, im_size=64, icl_init=False, r_l=None, kernel=None):
+    def __init__(self, d_model, patch_size=1, im_size=64, icl_init=False, r_l=None, ky_kernel=None, kx_name=None, kx_sigma=1.0):
         super(TransformerOperatorLayer, self).__init__()
         
         modes1 = patch_size // 2 + 1
@@ -174,7 +208,7 @@ class TransformerOperatorLayer(nn.Module):#
         self.size_col   = im_size
         self.d_model    = d_model
 
-        self.self_attn = AttentionOperator(d_model, modes1, modes2, im_size, kernel, r_l)
+        self.self_attn = AttentionOperator(d_model, modes1, modes2, im_size, ky_kernel, r_l, kx_name, kx_sigma)
         
         if icl_init:
             init_spectral_identity_weights(self.self_attn.query_operator,   modes1, modes2, scale=1.0)
@@ -188,7 +222,7 @@ class TransformerOperatorLayer(nn.Module):#
 
 
 class TransformerOperator(nn.Module):
-    def __init__(self, num_layers, im_size, kernel, icl_lr=1e-3, icl_init=False):
+    def __init__(self, num_layers, im_size, ky_kernel, kx_name, kx_sigma=1.0, icl_lr=1e-3, icl_init=False):
         super(TransformerOperator, self).__init__()
         patch_size = im_size[1]
 
@@ -200,7 +234,9 @@ class TransformerOperator(nn.Module):
                 im_size=im_size,
                 icl_init=icl_init,
                 r_l=icl_lr, # step size for in-context learning gradient descent
-                kernel=kernel, 
+                ky_kernel=ky_kernel, 
+                kx_name=kx_name,
+                kx_sigma=kx_sigma,
             ))
 
         self.layers = nn.ModuleList(transformer_layers)
