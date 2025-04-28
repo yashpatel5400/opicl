@@ -79,22 +79,18 @@ def construct_Z(f_test, Of, f, im_size, device="cuda"):
     Z_pt[:,-1,im_size[0]:] = 0
     return Z_pt
 
-def viz_errors(kx_name_true, kernel_to_errors):
-    plt.clf()
-    plt.title(f"True Kernel: {kx_name_true}")
-    plt.xlabel("Layers")
-    plt.ylabel("|| u - Of ||^2")
+def viz_errors(ax, kx_name_true, kernel_to_errors):
+    ax.set_title(f"True Kernel: {kx_name_true}")
+    ax.set_xlabel("Layers")
+    ax.set_ylabel("|| u - Of ||^2")
 
     for kernel_name in kernel_to_errors:
         if np.isfinite(kernel_to_errors[kernel_name][-1]):
-            plt.semilogy(kernel_to_errors[kernel_name], label=kernel_name)
+            ax.semilogy(kernel_to_errors[kernel_name], label=kernel_name)
         
-    plt.legend()
+    ax.legend()
 
-    os.makedirs("results", exist_ok=True)
-    plt.savefig(os.path.join("results", f"{kx_name_true}.png"))
-
-def main(kx_name_true):
+def main(ax, kx_name_true):
     H, W = 64, 64
     kernel_maps = kernels.Kernels(H, W)
 
@@ -135,11 +131,20 @@ def main(kx_name_true):
         kernel_to_preds[kx_name]  = test_preds
         kernel_to_errors[kx_name] = errors
 
-    viz_errors(kx_name_true, kernel_to_errors)
+    viz_errors(ax, kx_name_true, kernel_to_errors)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--kx")
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--kx")
+    # args = parser.parse_args()
     
-    main(args.kx)
+    fig, axs = plt.subplots(2, 2, figsize=(10,10))
+    kx_names = ['linear', 'laplacian', 'gradient_rbf', 'energy']
+    
+    for i, kx_name in enumerate(kx_names):
+        row, col = divmod(i, 2)
+        main(axs[row, col], kx_name)
+    
+    os.makedirs("results", exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join("results", "blup.png"))
