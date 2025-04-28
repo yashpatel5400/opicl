@@ -1,5 +1,6 @@
 import argparse
 import os
+import seaborn as sns
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -79,18 +80,28 @@ def construct_Z(f_test, Of, f, im_size, device="cuda"):
     Z_pt[:,-1,im_size[0]:] = 0
     return Z_pt
 
-def viz_errors(ax, kx_name_true, kernel_to_errors):
-    ax.set_title(f"True Kernel: {kx_name_true}")
-    ax.set_xlabel("Layers")
-    ax.set_ylabel("|| u - Of ||^2")
+def format_title(kx_name_true):
+    return " ".join([word.capitalize() if word != "rbf" else "RBF" for word in kx_name_true.split("_")])
 
-    for kernel_name in kernel_to_errors:
-        if np.isfinite(kernel_to_errors[kernel_name][-1]):
-            ax.semilogy(kernel_to_errors[kernel_name], label=kernel_name)
-        
-    ax.legend()
+def viz_errors(ax, kx_name_true, kernel_to_errors, show_xlabel=False, show_ylabel=False):
+    ax.set_title(format_title(kx_name_true), fontsize=16, fontweight='bold')
 
-def main(ax, kx_name_true):
+    if show_xlabel:
+        ax.set_xlabel("Layers", fontsize=14)
+    if show_ylabel:
+        ax.set_ylabel(r"$\| u - \mathcal{O}f \|^2$", fontsize=14)
+
+    colors = sns.color_palette("colorblind", n_colors=4)
+
+    for idx, (kernel_name, errors) in enumerate(kernel_to_errors.items()):
+        if np.isfinite(errors[-1]):
+            ax.semilogy(errors, label=kernel_name, linewidth=2.5, color=colors[idx])
+
+    ax.grid(True, which='both', linestyle='--', alpha=0.7)
+    ax.legend(fontsize=10, loc='upper right', frameon=True)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+
+def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False):
     H, W = 64, 64
     kernel_maps = kernels.Kernels(H, W)
 
@@ -104,8 +115,8 @@ def main(ax, kx_name_true):
         kx_true, ky_true, num_samples=num_samples
     )
 
-    f_test   = f[-1]
-    Of_test  = Of[-1]
+    f_test = f[-1]
+    Of_test = Of[-1]
 
     im_size = (64, 64)
     device = "cuda"
@@ -114,7 +125,7 @@ def main(ax, kx_name_true):
     kernel_to_preds, kernel_to_errors = {}, {}
     for kx_name in kx_names:
         r = .01
-        num_layers = 250
+        num_layers = 500
         opformer = TransformerOperator(
             num_layers=num_layers, 
             im_size=im_size, 
@@ -125,26 +136,27 @@ def main(ax, kx_name_true):
             icl_init=True).to(device)
 
         _, preds = opformer(Z_test)
-        test_preds = np.array([pred[0,-1,64:,:,0] for pred in preds]) # just extract bottom right for test prediction
+        test_preds = np.array([pred[0,-1,64:,:,0] for pred in preds])
         errors = np.array([np.linalg.norm(test_pred + Of_test) for test_pred in test_preds])
 
         kernel_to_preds[kx_name]  = test_preds
         kernel_to_errors[kx_name] = errors
 
-    viz_errors(ax, kx_name_true, kernel_to_errors)
+    viz_errors(ax, kx_name_true, kernel_to_errors, show_xlabel, show_ylabel)
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--kx")
-    # args = parser.parse_args()
-    
-    fig, axs = plt.subplots(2, 2, figsize=(10,10))
+    sns.set_theme(style="whitegrid", palette="muted", font_scale=1.2)
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 12))
     kx_names = ['linear', 'laplacian', 'gradient_rbf', 'energy']
-    
+
     for i, kx_name in enumerate(kx_names):
         row, col = divmod(i, 2)
-        main(axs[row, col], kx_name)
-    
-    os.makedirs("results", exist_ok=True)
+        show_ylabel = (col == 0)  # Only left column
+        show_xlabel = (row == 1)  # Only bottom row
+        main(axs[row, col], kx_name, show_xlabel=show_xlabel, show_ylabel=show_ylabel)
+
     plt.tight_layout()
-    plt.savefig(os.path.join("results", "blup.png"))
+    os.makedirs("results", exist_ok=True)
+    plt.savefig(os.path.join("results", "blup_final.png"), dpi=300, bbox_inches='tight')
+    plt.show()
