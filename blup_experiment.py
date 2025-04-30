@@ -1,6 +1,8 @@
+import pickle
 import argparse
 import os
 import seaborn as sns
+import pickle
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -47,29 +49,30 @@ def np_conv(kernel, img):
     return result
 
 
-def make_simple_learnable_operator_dataset(kx, ky, num_samples=25, H=64, W=64, sigma=1.0, seed=42):
-    # Sample 5 random basis pairs (f_i, g_i)
+def make_random_operator_dataset(kx, ky, num_samples=25, num_bases=5, H=64, W=64, seed=42):
     np.random.seed(seed)
 
     alpha, beta, gamma, N = 1.0, 1.0, 4.0, H
-    num_bases = 1
 
+    # Sample basis functions
     basis_fs = GRF(alpha, beta, gamma, N, num_bases)
     basis_gs = GRF(alpha, beta, gamma, N, num_bases)
 
-    # Precompute convolutions (k * g_i)
+    # Precompute convolutions (k_y * g_i)
     g_convs = np.array([np_conv(ky, g) for g in basis_gs])
+
+    # Sample random weights λ_i ~ N(0,1)
+    lambdas = np.random.randn(num_bases)
 
     # Sample new input functions
     fs = GRF(alpha, beta, gamma, N, num_samples)
 
-    # Compute operator outputs:
-    # O(f) = sum_{i=1}^5 <f, f_i> * (k * g_i)
+    # Apply operator
     Ofs = np.zeros((num_samples, H, W))
     for j in range(num_samples):
         for i in range(num_bases):
             inner = kx(fs[j], basis_fs[i])
-            Ofs[j] += inner * g_convs[i]
+            Ofs[j] += lambdas[i] * inner * g_convs[i]
 
     return fs, Ofs
 
@@ -80,28 +83,7 @@ def construct_Z(f_test, Of, f, im_size, device="cuda"):
     Z_pt[:,-1,im_size[0]:] = 0
     return Z_pt
 
-def format_title(kx_name_true):
-    return " ".join([word.capitalize() if word != "rbf" else "RBF" for word in kx_name_true.split("_")])
-
-def viz_errors(ax, kx_name_true, kernel_to_errors, show_xlabel=False, show_ylabel=False):
-    ax.set_title(format_title(kx_name_true), fontsize=16, fontweight='bold')
-
-    if show_xlabel:
-        ax.set_xlabel("Layers", fontsize=14)
-    if show_ylabel:
-        ax.set_ylabel(r"$\| u - \mathcal{O}f \|^2$", fontsize=14)
-
-    colors = sns.color_palette("colorblind", n_colors=4)
-
-    for idx, (kernel_name, errors) in enumerate(kernel_to_errors.items()):
-        if np.isfinite(errors[-1]):
-            ax.semilogy(errors, label=kernel_name, linewidth=2.5, color=colors[idx])
-
-    ax.grid(True, which='both', linestyle='--', alpha=0.7)
-    ax.legend(fontsize=10, loc='upper right', frameon=True)
-    ax.tick_params(axis='both', which='major', labelsize=12)
-
-def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False):
+def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
     H, W = 64, 64
     kernel_maps = kernels.Kernels(H, W)
 
@@ -111,10 +93,10 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False):
     ky_true = kernel_maps.get_kernel("gaussian")
 
     num_samples = 25
-    f, Of = make_simple_learnable_operator_dataset(
-        kx_true, ky_true, num_samples=num_samples
+    f, Of = make_random_operator_dataset(
+        kx_true, ky_true, num_samples=num_samples, num_bases=10, seed=seed,
     )
-
+    
     f_test = f[-1]
     Of_test = Of[-1]
 
@@ -125,7 +107,7 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False):
     kernel_to_preds, kernel_to_errors = {}, {}
     for kx_name in kx_names:
         r = .01
-        num_layers = 500
+        num_layers = 250
         opformer = TransformerOperator(
             num_layers=num_layers, 
             im_size=im_size, 
@@ -141,22 +123,31 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False):
 
         kernel_to_preds[kx_name]  = test_preds
         kernel_to_errors[kx_name] = errors
-
-    viz_errors(ax, kx_name_true, kernel_to_errors, show_xlabel, show_ylabel)
+    return kernel_to_preds, kernel_to_errors
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int)
+    args = parser.parse_args()
+
     sns.set_theme(style="whitegrid", palette="muted", font_scale=1.2)
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 12))
     kx_names = ['linear', 'laplacian', 'gradient_rbf', 'energy']
 
+    true_kx_to_preds, true_kx_to_errors = {}, {}
     for i, kx_name in enumerate(kx_names):
         row, col = divmod(i, 2)
         show_ylabel = (col == 0)  # Only left column
         show_xlabel = (row == 1)  # Only bottom row
-        main(axs[row, col], kx_name, show_xlabel=show_xlabel, show_ylabel=show_ylabel)
+        kernel_to_preds, kernel_to_errors = main(axs[row, col], kx_name, show_xlabel=show_xlabel, show_ylabel=show_ylabel, seed=args.seed)
 
-    plt.tight_layout()
+        true_kx_to_preds[kx_name]  = kernel_to_preds
+        true_kx_to_errors[kx_name] = kernel_to_errors
+
     os.makedirs("results", exist_ok=True)
-    plt.savefig(os.path.join("results", "blup_final.png"), dpi=300, bbox_inches='tight')
-    plt.show()
+    with open(os.path.join("results", f"preds_trial={args.seed}.pkl"), "wb") as f:
+        pickle.dump(true_kx_to_preds, f)
+
+    with open(os.path.join("results", f"errors_trial={args.seed}.pkl"), "wb") as f:
+        pickle.dump(true_kx_to_errors, f)
