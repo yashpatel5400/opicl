@@ -27,8 +27,8 @@ def viz_errors(ax, kx_name_true, kernel_to_full_errors, show_xlabel=False, show_
         std  = np.std(kernel_to_full_errors[kernel_name], axis=0)
         
         x     = np.arange(mean.shape[0])
-        lower = mean - 0.5 * std
-        upper = mean + 0.5 * std
+        lower = mean - std
+        upper = mean + std
 
         ax.plot(x, mean, label=kernel_name, linewidth=2.5, color=colors[idx])
         ax.fill_between(x, lower, upper, alpha=0.3)

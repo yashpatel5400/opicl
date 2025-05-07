@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 
+import kernels
+
 device = "cuda"
 
 class SpectralConv2d_Attention(nn.Module):
@@ -42,7 +44,49 @@ class SpectralConv2d_Attention(nn.Module):
         return x
 
 
-def apply_spatial_conv(value, kernel):
+class RestrictedSpectralOperator(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2, scale=1.0):
+        super().__init__()
+        assert in_channels == out_channels, "Restricted operator assumes square channels"
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.nhead = 1  # still assuming 1 head
+
+        # Learnable scalar (shared across all frequencies and channels)
+        self.scalar = nn.Parameter(torch.tensor(scale, dtype=torch.float32))
+
+    def compl_mul2d(self, input, scale):
+        B, T, C, H, W = input.shape
+        device = input.device
+
+        weight = torch.zeros(C, C, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat, device=device)
+        for i in range(C):
+            weight[i, i, :, :, 0] = scale
+
+        return torch.einsum("bnixy,ioxyh->bnoxyh", input, weight)
+
+    def forward(self, x):
+        B, T, H, W, C = x.shape
+        x = torch.permute(x, (0, 1, 4, 2, 3))  # (B, T, C, H, W)
+        x_ft = torch.fft.rfft2(x)
+
+        out_ft = torch.zeros(B, T, self.out_channels, H, W//2 + 1, self.nhead, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :, :self.modes1, :self.modes2, :] = self.compl_mul2d(
+            x_ft[:, :, :, :self.modes1, :self.modes2], self.scalar
+        )
+        out_ft[:, :, :, -self.modes1:, :self.modes2, :] = self.compl_mul2d(
+            x_ft[:, :, :, -self.modes1:, :self.modes2], self.scalar
+        )
+
+        x = torch.fft.irfft2(out_ft, s=(H, W), dim=(-3, -2))
+        x = torch.permute(x, (0, 1, 3, 4, 2, 5))[..., 0]  # (B, T, H, W, C)
+        return x
+
+
+def apply_spatial_conv_unbatched(value, kernel):
     """
     value: (B, nH, T, H, W, d)
     kernel: (1, 1, 1, Hk, Wk)
@@ -76,6 +120,35 @@ def apply_spatial_conv(value, kernel):
             padding=0,
         ))
     return torch.stack(value_convs).squeeze().unsqueeze(0).unsqueeze(-1)  # (B, T, H, W, d)
+
+
+def apply_spatial_conv(value, kernel):
+    """
+    value:  (B, T, H, W, 1)
+    kernel: (1, 1, Hk, Wk)
+    Returns:
+        value_convolved: (B, T, H, W, 1)
+    """
+    B, T, H, W, _ = value.shape
+    kh, kw = kernel.shape[-2:]
+
+    # Merge batch and time dimensions for parallel conv
+    x = value.view(B * T, 1, H, W)  # shape: (B*T, 1, H, W)
+
+    # Compute asymmetric 'same' padding
+    ph_top    = kh // 2
+    ph_bottom = kh - ph_top - 1
+    pw_left   = kw // 2
+    pw_right  = kw - pw_left - 1
+
+    # Apply circular padding
+    x_padded = F.pad(x, (pw_left, pw_right, ph_top, ph_bottom), mode='circular')
+
+    # Apply depthwise 2D convolution
+    conv = F.conv2d(x_padded, kernel, padding=0)  # shape: (B*T, 1, H, W)
+
+    # Reshape back to (B, T, H, W, 1)
+    return conv.view(B, T, H, W, 1)
 
 
 class ScaledDotProductAttention_Operator(nn.Module):
@@ -144,9 +217,9 @@ class ScaledDotProductAttention_Operator(nn.Module):
         # Convolve value with spatial kernel
         value_convolved = apply_spatial_conv(value, self.ky_kernel)  # (B, T, H, W, C)
 
-        v = value_convolved.permute(0, 2, 3, 4, 1)  # (B, H, W, C, T)
-        attn = torch.matmul(v, kx)                  # (B, H, W, C, T)
-        output = attn.permute(0, 4, 1, 2, 3)        # (B, T, H, W, C)
+        v = value_convolved.permute(0, 2, 3, 4, 1)      # (B, H, W, C, T)
+        attn = torch.einsum('bhwnt,btt->bhwnt', v, kx)  # (B, H, W, C, T)
+        output = attn.permute(0, 4, 1, 2, 3)            # (B, T, H, W, C)
 
         return output
 
@@ -156,15 +229,11 @@ class AttentionOperator(nn.Module):
         self.d_k = d_model
         self.im_size = im_size
 
-        self.query_operator   = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2)
-        self.key_operator     = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2)
-
-        self.value_operator_x = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2) 
-        self.value_operator_y = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2)
+        self.query_operator = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2)
+        self.key_operator   = SpectralConv2d_Attention(d_model, self.d_k, modes1, modes2)
+        self.value_operator = RestrictedSpectralOperator(d_model, self.d_k, modes1, modes2, scale=icl_lr)
 
         self.scaled_dot_product_attention = ScaledDotProductAttention_Operator(im_size, ky_kernel, kx_name, kx_sigma)
-
-        self.icl_lr = icl_lr
 
     def forward(self, z):
         batch, T, full_H, W, _ = z.size() # z : N x T x 2H x W x C
@@ -175,7 +244,7 @@ class AttentionOperator(nn.Module):
         # using the more general masking approach, but the dimension matching is slightly easier this way
         query = self.query_operator(x)
         key   = self.key_operator(x)
-        value = self.value_operator_y(y)
+        value = self.value_operator(y)
 
         # NOTE: following assumes attention is computed with only 1 head
         attn_y = self.scaled_dot_product_attention(query, key, value).reshape(batch, T, H, W, -1)
@@ -213,8 +282,8 @@ class TransformerOperatorLayer(nn.Module):#
         if icl_init:
             init_spectral_identity_weights(self.self_attn.query_operator,   modes1, modes2, scale=1.0)
             init_spectral_identity_weights(self.self_attn.key_operator,     modes1, modes2, scale=1.0)
-            init_spectral_identity_weights(self.self_attn.value_operator_x, modes1, modes2, scale=0.0)
-            init_spectral_identity_weights(self.self_attn.value_operator_y, modes1, modes2, scale=r_l)
+            # init_spectral_identity_weights(self.self_attn.value_operator_x, modes1, modes2, scale=0.0)
+            # init_spectral_identity_weights(self.self_attn.value_operator,   modes1, modes2, scale=r_l)
 
     def forward(self, z):
         z = z + self.self_attn(z) # N x T x 2H x W x C
@@ -252,3 +321,88 @@ class TransformerOperator(nn.Module):
             z = layer(z) # B x T x 2H x W x 3
             zs.append(z.cpu().detach().numpy())
         return z[:,-1,H//2:,:,0], zs    # B x 1 x H x W x 1 -- bottom right is prediction (in first channel)
+
+def test_apply_spatial_conv_batch_equivalence():
+    # Test configuration
+    B, T, H, W = 2, 3, 8, 8
+    torch.manual_seed(0)
+    value = torch.randn(B, T, H, W, 1)
+    kernel = torch.randn(1, 1, 3, 3)
+
+    # Run original implementation one-by-one
+    out_manual = []
+    for b in range(B):
+        val_b = value[b:b+1]  # (1, T, H, W, 1)
+        out_b = apply_spatial_conv_unbatched(val_b, kernel)
+        out_manual.append(out_b)
+    out_manual = torch.cat(out_manual, dim=0)  # shape (B, T, H, W, 1)
+
+    # Run batched implementation
+    out_batch = apply_spatial_conv(value, kernel)
+
+    # Compare
+    assert torch.allclose(out_manual, out_batch, atol=1e-5), "Mismatch between manual and batched conv!"
+    print("✅ Batched convolution matches manual looped version.")
+
+def test_batch_vs_single_consistency(model, input_tensor):
+    """
+    model: instance of TransformerOperator
+    input_tensor: torch.Tensor of shape (B, T, 2H, W)
+    """
+    model.eval()
+    with torch.no_grad():
+        B, T, H2, W = input_tensor.shape
+        H = H2 // 2
+
+        # Batch output
+        batch_output, _ = model(input_tensor)  # shape: (B, H, W)
+
+        # Individual outputs
+        single_outputs = []
+        for b in range(B):
+            single_input = input_tensor[b:b+1]  # shape (1, T, 2H, W)
+            single_output, _ = model(single_input)
+            single_outputs.append(single_output.squeeze(0))  # (H, W)
+
+        single_output_stacked = torch.stack(single_outputs)  # (B, H, W)
+
+        # Compare
+        diff = torch.norm(batch_output - single_output_stacked)
+        print(f"L2 norm difference between batch and individual results: {diff.item():.6e}")
+
+        assert torch.allclose(batch_output, single_output_stacked, atol=1e-5), \
+            "Batch and single-inference outputs differ!"
+
+        print("✅ Batch and single-inference outputs match.")
+
+if __name__ == "__main__":
+    test_apply_spatial_conv_batch_equivalence()
+
+    H, W = 64, 64
+    kernel_maps = kernels.Kernels(H, W)
+
+    kx_sigma = 1.0
+    kx_name = "linear"
+    kx_name_true = "linear"
+    
+    kx_true = kernels.get_kx_kernel(kx_name_true, sigma=kx_sigma)
+    ky_true = kernel_maps.get_kernel("gaussian")
+
+    im_size = (64, 64)
+    device = "cuda"
+
+    kernel_to_preds, kernel_to_errors = {}, {}
+    r = .01
+    num_layers = 3
+    opformer = TransformerOperator(
+        num_layers=num_layers, 
+        im_size=im_size, 
+        ky_kernel=ky_true, 
+        kx_name=kx_name, 
+        kx_sigma=kx_sigma, 
+        icl_lr=-r, 
+        icl_init=True).to(device)
+    
+    B = 4
+    z = torch.randn(B, 25, 128, 64).to(device)
+    test_batch_vs_single_consistency(opformer, z)

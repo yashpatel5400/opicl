@@ -11,77 +11,7 @@ from scipy.signal import correlate2d
 
 from opformer import TransformerOperator
 import kernels
-
-def GRF(alpha, beta, gamma, N, num_samples=10):
-    xi = np.random.randn(num_samples, N, N)
-    K1, K2 = np.meshgrid(np.arange(N), np.arange(N), indexing='ij')
-    freq_sq = (K1**2 + K2**2)
-    coef = alpha**0.5 * (4*np.pi**2 * freq_sq + beta)**(-gamma/2)
-    L = N * coef * xi
-    L[:, 0, 0] = 0  # enforce mean 0
-    f_spatials = np.real(ifftn(L, norm='forward', axes=(-2, -1)))
-    return f_spatials
-
-def np_conv(kernel, img):
-    kh, kw = kernel.shape
-    H, W = img.shape
-
-    # Compute asymmetric 'same' padding for even-sized kernels
-    ph_top = kh // 2
-    ph_bottom = kh - ph_top - 1
-    pw_left = kw // 2
-    pw_right = kw - pw_left - 1
-
-    # Circular (wrap-around) padding
-    padded = np.pad(
-        img,
-        ((ph_top, ph_bottom), (pw_left, pw_right)),
-        mode='wrap'
-    )
-
-    # Perform cross-correlation (equivalent to conv2d with no flipping in PyTorch)
-    # If you need strict convolution, flip the kernel:
-    kernel_flipped = np.flip(kernel, axis=(0, 1))
-
-    # Use 'valid' to get result of original size due to pre-padding
-    result = correlate2d(padded, kernel_flipped, mode='valid')
-
-    return result
-
-
-def make_random_operator_dataset(kx, ky, num_samples=25, num_bases=5, H=64, W=64, seed=42):
-    np.random.seed(seed)
-
-    alpha, beta, gamma, N = 1.0, 1.0, 4.0, H
-
-    # Sample basis functions
-    basis_fs = GRF(alpha, beta, gamma, N, num_bases)
-    basis_gs = GRF(alpha, beta, gamma, N, num_bases)
-
-    # Precompute convolutions (k_y * g_i)
-    g_convs = np.array([np_conv(ky, g) for g in basis_gs])
-
-    # Sample random weights λ_i ~ N(0,1)
-    lambdas = np.random.randn(num_bases)
-
-    # Sample new input functions
-    fs = GRF(alpha, beta, gamma, N, num_samples)
-
-    # Apply operator
-    Ofs = np.zeros((num_samples, H, W))
-    for j in range(num_samples):
-        for i in range(num_bases):
-            inner = kx(fs[j], basis_fs[i])
-            Ofs[j] += lambdas[i] * inner * g_convs[i]
-
-    return fs, Ofs
-
-def construct_Z(f_test, Of, f, im_size, device="cuda"):
-    f_full = np.concatenate([f[:-1], np.expand_dims(f_test, axis=0)], axis=0)
-    Z = np.expand_dims(np.concatenate([f_full, Of], axis=1), axis=0)
-    Z_pt = torch.from_numpy(Z).to(device).to(torch.float32)
-    Z_pt[:,-1,im_size[0]:] = 0
-    return Z_pt
+import dataset
 
 def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
     H, W = 64, 64
@@ -93,7 +23,7 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
     ky_true = kernel_maps.get_kernel("gaussian")
 
     num_samples = 25
-    f, Of = make_random_operator_dataset(
+    f, Of = dataset.make_random_operator_dataset(
         kx_true, ky_true, num_samples=num_samples, num_bases=10, seed=seed,
     )
     
@@ -102,7 +32,7 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
 
     im_size = (64, 64)
     device = "cuda"
-    Z_test = construct_Z(f_test, Of, f, im_size, device)
+    Z_test = dataset.construct_Z(f_test, Of, f, im_size, device)
 
     kernel_to_preds, kernel_to_errors = {}, {}
     for kx_name in kx_names:
