@@ -20,26 +20,26 @@ class MetaOperatorDataset(Dataset):
         self.H, self.W = im_size
         self.device = device
 
-        # Fixed operator components
-        alpha, beta, gamma, N = 1.0, 1.0, 4.0, self.H
-        self.basis_fs = dataset.GRF(alpha, beta, gamma, N, num_bases)
-        self.basis_gs = dataset.GRF(alpha, beta, gamma, N, num_bases)
-        self.lambdas = np.random.randn(num_bases)
-        self.g_convs = np.array([dataset.np_conv(ky, g) for g in self.basis_gs])
-
     def __len__(self):
         return self.num_meta_samples
 
     def __getitem__(self, idx):
-        # Resample input functions only
-        fs = dataset.GRF(1.0, 1.0, 4.0, self.H, self.num_incontext)
+        # Sample new basis functions and weights for this operator
+        alpha, beta, gamma, N = 1.0, 1.0, 4.0, self.H
+        basis_fs = dataset.GRF(alpha, beta, gamma, N, self.num_bases)
+        basis_gs = dataset.GRF(alpha, beta, gamma, N, self.num_bases)
+        lambdas = np.random.randn(self.num_bases)
+        g_convs = np.array([dataset.np_conv(self.ky, g) for g in basis_gs])
 
-        # Apply fixed operator
+        # Sample new input functions
+        fs = dataset.GRF(alpha, beta, gamma, N, self.num_incontext)
+
+        # Apply operator
         Ofs = np.zeros((self.num_incontext, self.H, self.W))
         for j in range(self.num_incontext):
             for i in range(self.num_bases):
-                inner = self.kx(fs[j], self.basis_fs[i])
-                Ofs[j] += self.lambdas[i] * inner * self.g_convs[i]
+                inner = self.kx(fs[j], basis_fs[i])
+                Ofs[j] += lambdas[i] * inner * g_convs[i]
 
         f_test = fs[-1]
         Of_test = Ofs[-1]
@@ -89,7 +89,7 @@ def log_predictions(Z, Of_true, model, epoch, out_dir="logs", max_samples=2):
             plt.axis("off")
 
             plt.subplot(1, 3, 2)
-            plt.imshow(preds_np[i], cmap='viridis')
+            plt.imshow(-preds_np[i], cmap='viridis')
             plt.title("Predicted Output")
             plt.axis("off")
 
@@ -120,10 +120,10 @@ def train():
         kx_name=kx_name, 
         kx_sigma=1.0, 
         icl_lr=-0.01, 
-        icl_init=True
+        icl_init=False,
     ).to(device)
 
-    dataset_len = 1
+    dataset_len = 100
     dataloader = get_dataloader(
         num_meta_samples=dataset_len,
         batch_size=8,
@@ -136,7 +136,7 @@ def train():
     optimizer = torch.optim.Adam(opformer.parameters(), lr=1e-4)
     losses = []
 
-    for epoch in range(20):
+    for epoch in range(100):
         print(f"Starting epoch {epoch}...")
         total_loss = 0.0
         for Z_batch, Of_batch in dataloader:

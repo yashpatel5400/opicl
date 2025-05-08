@@ -19,8 +19,8 @@ class SpectralConv2d_Attention(nn.Module):
         self.modes2 = modes2
         self.nhead = 1
         self.scale = (1 / (in_channels * out_channels))
-        self.weights1 = nn.Parameter(self.scale * (torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat)))
-        self.weights2 = nn.Parameter(self.scale * (torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat)))
+        self.weights1 = nn.Parameter(torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
 
     def compl_mul2d(self, input, weights):
         # (batch, num_patches, in_channel, x,y ), (in_channel, out_channel, x,y, nhead) -> (batch, num_patches, out_channel, x,y, nhead)
@@ -172,11 +172,11 @@ class ScaledDotProductAttention_Operator(nn.Module):
             kx = torch.matmul(q_, k_.transpose(-1, -2))
 
         elif self.kx_name == "laplacian":
-            # L1 distance
+            # L2 distance (correct)
             q_exp = q_.unsqueeze(2)  # (B, T, 1, D)
             k_exp = k_.unsqueeze(1)  # (B, 1, T, D)
-            l1_dist = torch.sum(torch.abs(q_exp - k_exp), dim=-1)  # (B, T, T)
-            kx = torch.exp(-l1_dist / self.kx_sigma)
+            l2_dist = torch.sqrt(torch.sum((q_exp - k_exp) ** 2, dim=-1) + 1e-8)  # (B, T, T)
+            kx = torch.exp(-l2_dist / self.kx_sigma)
 
         elif self.kx_name == "gradient_rbf":
             # Assume spatial gradients
@@ -216,9 +216,9 @@ class ScaledDotProductAttention_Operator(nn.Module):
 
         # Convolve value with spatial kernel
         value_convolved = apply_spatial_conv(value, self.ky_kernel)  # (B, T, H, W, C)
-
+        
         v = value_convolved.permute(0, 2, 3, 4, 1)      # (B, H, W, C, T)
-        attn = torch.einsum('bhwnt,btt->bhwnt', v, kx)  # (B, H, W, C, T)
+        attn = torch.einsum('bhwct,btq->bhwcq', v, kx)  # (B, H, W, C, T)
         output = attn.permute(0, 4, 1, 2, 3)            # (B, T, H, W, C)
 
         return output
@@ -282,8 +282,6 @@ class TransformerOperatorLayer(nn.Module):#
         if icl_init:
             init_spectral_identity_weights(self.self_attn.query_operator,   modes1, modes2, scale=1.0)
             init_spectral_identity_weights(self.self_attn.key_operator,     modes1, modes2, scale=1.0)
-            # init_spectral_identity_weights(self.self_attn.value_operator_x, modes1, modes2, scale=0.0)
-            # init_spectral_identity_weights(self.self_attn.value_operator,   modes1, modes2, scale=r_l)
 
     def forward(self, z):
         z = z + self.self_attn(z) # N x T x 2H x W x C

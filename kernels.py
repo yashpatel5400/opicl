@@ -81,7 +81,7 @@ def get_kx_kernel(kernel_type, sigma=1.0):
         return lambda f1, f2: np.sum(f1 * f2)
 
     elif kernel_type == 'laplacian':
-        return lambda f1, f2: np.exp(-np.sum(np.abs(f1 - f2)) / sigma)
+        return lambda f1, f2: np.exp(-np.linalg.norm(f1 - f2) / sigma)
 
     elif kernel_type == 'gradient_rbf':
         def grad_rbf(f1, f2):

@@ -44,7 +44,7 @@ def test_and_visualize(model, kx, ky, im_size=(64, 64), device="cuda", seed=123,
     axs[0].set_title("True Output")
     axs[0].axis("off")
 
-    axs[1].imshow(preds, cmap='viridis')
+    axs[1].imshow(-preds, cmap='viridis')
     axs[1].set_title("Model Prediction")
     axs[1].axis("off")
 
@@ -58,6 +58,63 @@ def test_and_visualize(model, kx, ky, im_size=(64, 64), device="cuda", seed=123,
     print(f"✅ Visualization saved to {save_path}")
     plt.close()
 
+def get_normalized_kernels(checkpoint_dir, model, layers_to_check=None):
+    """
+    Analyze whether W_k,l ~ b_l * Sigma^{-1} for learned Fourier weights across layers.
+
+    Args:
+        checkpoint_dir (str): Directory with model checkpoints (*.pth)
+        model (nn.Module): TransformerOperator instance (unloaded)
+        layers_to_check (list[int], optional): Which layers to evaluate. If None, checks all.
+    """
+    ckpt_files = sorted(
+        [f for f in os.listdir(checkpoint_dir) if f.endswith(".pth")],
+        key=lambda f: int("".join(filter(str.isdigit, f)))
+    )
+
+    last_ckpt = os.path.join(checkpoint_dir, ckpt_files[-1])
+    print(f"Loading weights from: {last_ckpt}")
+    state_dict = torch.load(last_ckpt, map_location="cpu")
+    model.load_state_dict(state_dict)
+
+    num_layers = len(model.layers)
+    if layers_to_check is None:
+        layers_to_check = list(range(num_layers))
+
+    # Extract key operator Fourier weights
+    R_k_list = []
+    for l in layers_to_check:
+        weight = model.layers[l].self_attn.key_operator.weights1.data
+        R_k = weight.squeeze()  # shape: (modes1, modes2)
+        R_k_list.append(R_k)
+
+    # Normalize all R_k to unit norm
+    R_k_normed = [(R / torch.norm(R)).detach().cpu().numpy() for R in R_k_list]
+    return R_k_normed
+
+def compute_residual_norms(normalized_kernels):
+    """
+    Compute residuals from the first normalized kernel as reference (i.e., Σ^{-1}).
+    Returns list of L2 residual norms per layer.
+    """
+    ref = normalized_kernels[0]
+    residuals = []
+    for k in normalized_kernels:
+        diff = k - ref
+        residual_norm = np.linalg.norm(diff)
+        residuals.append(residual_norm)
+    return residuals
+
+def plot_residuals(residuals, save_path=None):
+    plt.figure(figsize=(6, 4))
+    plt.plot(residuals, marker='o')
+    plt.title("Residuals of $\\tilde{R}_{k,\\ell}$ from $\\Sigma^{-1}$")
+    plt.xlabel("Layer $\\ell$")
+    plt.ylabel("Residual Norm $\\| \\tilde{R}_{k,\\ell} - \\Sigma^{-1} \\|$")
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
 
 def main():
     # === Config ===
@@ -78,12 +135,12 @@ def main():
         kx_name=kx_name,
         kx_sigma=1.0,
         icl_lr=-0.01,
-        icl_init=True
+        icl_init=False
     ).to(device)
 
-    model = load_latest_checkpoint(model)
-    test_and_visualize(model, kx, ky_kernel, im_size, device=device)
-
+    normalized_kernels = get_normalized_kernels("checkpoints", model)
+    residuals = compute_residual_norms(normalized_kernels)
+    plot_residuals(residuals, save_path="kernel_key_operator_residuals.png")
 
 if __name__ == "__main__":
     main()
