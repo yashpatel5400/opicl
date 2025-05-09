@@ -19,8 +19,10 @@ class SpectralConv2d_Attention(nn.Module):
         self.modes2 = modes2
         self.nhead = 1
         self.scale = (1 / (in_channels * out_channels))
-        self.weights1 = nn.Parameter(torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
-        self.weights2 = nn.Parameter(torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
+
+        rand_wt_wscale = 1.0
+        self.weights1 = nn.Parameter(rand_wt_wscale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(rand_wt_wscale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
 
     def compl_mul2d(self, input, weights):
         # (batch, num_patches, in_channel, x,y ), (in_channel, out_channel, x,y, nhead) -> (batch, num_patches, out_channel, x,y, nhead)
@@ -151,6 +153,47 @@ def apply_spatial_conv(value, kernel):
     return conv.view(B, T, H, W, 1)
 
 
+def compute_kx(query, key, kx_name, kx_sigma):
+    B, T, H, W, C = query.shape
+    q_ = query.reshape(query.shape[0], query.shape[1], -1)
+    k_ = key.reshape(key.shape[0], key.shape[1], -1)
+
+    if kx_name == "linear":
+        kx = torch.matmul(q_, k_.transpose(-1, -2))
+
+    elif kx_name == "laplacian":
+        # L2 distance (correct)
+        q_exp = q_.unsqueeze(2)  # (B, T, 1, D)
+        k_exp = k_.unsqueeze(1)  # (B, 1, T, D)
+        l2_dist = torch.sqrt(torch.sum((q_exp - k_exp) ** 2, dim=-1) + 1e-8)  # (B, T, T)
+        kx = torch.exp(-l2_dist / kx_sigma)
+
+    elif kx_name == "gradient_rbf":
+        # Assume spatial gradients
+        q_grad_y = q_.reshape(B, T, H, W, C).diff(dim=2, append=q_.reshape(B, T, H, W, C)[:,:,-1:,:,:])  # simple gradient along y
+        q_grad_x = q_.reshape(B, T, H, W, C).diff(dim=3, append=q_.reshape(B, T, H, W, C)[:,:,:,-1:,:])  # simple gradient along x
+        k_grad_y = key.diff(dim=2, append=key[:,:,-1:,:,:])
+        k_grad_x = key.diff(dim=3, append=key[:,:,:,-1:,:])
+
+        qg = torch.cat([q_grad_x, q_grad_y], dim=-1).reshape(B, T, -1)
+        kg = torch.cat([k_grad_x, k_grad_y], dim=-1).reshape(B, T, -1)
+        qg_norm = (qg ** 2).sum(dim=-1, keepdim=True)
+        kg_norm = (kg ** 2).sum(dim=-1, keepdim=True)
+        dist_sq = qg_norm + kg_norm.transpose(-1, -2) - 2 * torch.matmul(qg, kg.transpose(-1, -2))
+        kx = torch.exp(-dist_sq / (2 * kx_sigma**2))
+
+    elif kx_name == "energy":
+        q_energy = (q_ ** 2).sum(dim=-1, keepdim=True)
+        k_energy = (k_ ** 2).sum(dim=-1, keepdim=True)
+        energy_diff = q_energy - k_energy.transpose(-1, -2)
+        kx = torch.exp(-(energy_diff ** 2) / (2 * kx_sigma**2))
+
+    else:
+        raise ValueError(f"Unsupported kx_name: {kx_name}")
+
+    return kx
+
+
 class ScaledDotProductAttention_Operator(nn.Module):
     def __init__(self, im_size, ky_kernel, kx_name='linear', kx_sigma=1.0):
         super(ScaledDotProductAttention_Operator, self).__init__()
@@ -163,51 +206,11 @@ class ScaledDotProductAttention_Operator(nn.Module):
         self.kx_name = kx_name
         self.kx_sigma = kx_sigma
 
-    def compute_kx(self, query, key):
-        B, T, H, W, C = query.shape
-        q_ = query.reshape(B, T, -1)
-        k_ = key.reshape(B, T, -1)
-
-        if self.kx_name == "linear":
-            kx = torch.matmul(q_, k_.transpose(-1, -2))
-
-        elif self.kx_name == "laplacian":
-            # L2 distance (correct)
-            q_exp = q_.unsqueeze(2)  # (B, T, 1, D)
-            k_exp = k_.unsqueeze(1)  # (B, 1, T, D)
-            l2_dist = torch.sqrt(torch.sum((q_exp - k_exp) ** 2, dim=-1) + 1e-8)  # (B, T, T)
-            kx = torch.exp(-l2_dist / self.kx_sigma)
-
-        elif self.kx_name == "gradient_rbf":
-            # Assume spatial gradients
-            q_grad_y = q_.reshape(B, T, H, W, C).diff(dim=2, append=q_.reshape(B, T, H, W, C)[:,:,-1:,:,:])  # simple gradient along y
-            q_grad_x = q_.reshape(B, T, H, W, C).diff(dim=3, append=q_.reshape(B, T, H, W, C)[:,:,:,-1:,:])  # simple gradient along x
-            k_grad_y = key.diff(dim=2, append=key[:,:,-1:,:,:])
-            k_grad_x = key.diff(dim=3, append=key[:,:,:,-1:,:])
-
-            qg = torch.cat([q_grad_x, q_grad_y], dim=-1).reshape(B, T, -1)
-            kg = torch.cat([k_grad_x, k_grad_y], dim=-1).reshape(B, T, -1)
-            qg_norm = (qg ** 2).sum(dim=-1, keepdim=True)
-            kg_norm = (kg ** 2).sum(dim=-1, keepdim=True)
-            dist_sq = qg_norm + kg_norm.transpose(-1, -2) - 2 * torch.matmul(qg, kg.transpose(-1, -2))
-            kx = torch.exp(-dist_sq / (2 * self.kx_sigma**2))
-
-        elif self.kx_name == "energy":
-            q_energy = (q_ ** 2).sum(dim=-1, keepdim=True)
-            k_energy = (k_ ** 2).sum(dim=-1, keepdim=True)
-            energy_diff = q_energy - k_energy.transpose(-1, -2)
-            kx = torch.exp(-(energy_diff ** 2) / (2 * self.kx_sigma**2))
-
-        else:
-            raise ValueError(f"Unsupported kx_name: {self.kx_name}")
-
-        return kx
-
     def forward(self, query, key, value):
         B, T, H, W, C = query.shape
 
         # Compute k_x similarity
-        unmasked_kx = self.compute_kx(query, key)
+        unmasked_kx = compute_kx(query, key, self.kx_name, self.kx_sigma)
 
         # Masking: copy from your original if needed
         M = torch.zeros((T, T), device=query.device, dtype=torch.float32)
@@ -268,8 +271,8 @@ class TransformerOperatorLayer(nn.Module):#
     def __init__(self, d_model, patch_size=1, im_size=64, icl_init=False, r_l=None, ky_kernel=None, kx_name=None, kx_sigma=1.0):
         super(TransformerOperatorLayer, self).__init__()
         
-        modes1 = patch_size // 2 + 1
-        modes2 = patch_size // 2 + 1
+        modes1 = 8 # patch_size // 2 + 1
+        modes2 = 8 # patch_size // 2 + 1
         
         self.patch_size = patch_size
         self.im_size    = im_size
