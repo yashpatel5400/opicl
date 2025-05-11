@@ -19,10 +19,8 @@ class SpectralConv2d_Attention(nn.Module):
         self.modes2 = modes2
         self.nhead = 1
         self.scale = (1 / (in_channels * out_channels))
-
-        rand_wt_wscale = 1.0
-        self.weights1 = nn.Parameter(rand_wt_wscale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
-        self.weights2 = nn.Parameter(rand_wt_wscale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat))
+        self.weights1 = nn.Parameter(self.scale * (torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat)))
+        self.weights2 = nn.Parameter(self.scale * (torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.nhead, dtype=torch.cfloat)))
 
     def compl_mul2d(self, input, weights):
         # (batch, num_patches, in_channel, x,y ), (in_channel, out_channel, x,y, nhead) -> (batch, num_patches, out_channel, x,y, nhead)
@@ -154,7 +152,8 @@ def apply_spatial_conv(value, kernel):
 
 
 def compute_kx(query, key, kx_name, kx_sigma):
-    B, T, H, W, C = query.shape
+    B, T_q, H, W, C = query.shape
+    _, T_k, _, _, _ = key.shape
     q_ = query.reshape(query.shape[0], query.shape[1], -1)
     k_ = key.reshape(key.shape[0], key.shape[1], -1)
 
@@ -170,13 +169,13 @@ def compute_kx(query, key, kx_name, kx_sigma):
 
     elif kx_name == "gradient_rbf":
         # Assume spatial gradients
-        q_grad_y = q_.reshape(B, T, H, W, C).diff(dim=2, append=q_.reshape(B, T, H, W, C)[:,:,-1:,:,:])  # simple gradient along y
-        q_grad_x = q_.reshape(B, T, H, W, C).diff(dim=3, append=q_.reshape(B, T, H, W, C)[:,:,:,-1:,:])  # simple gradient along x
+        q_grad_y = query.diff(dim=2, append=query[:,:,-1:,:,:])  # simple gradient along y
+        q_grad_x = query.diff(dim=3, append=query[:,:,:,-1:,:])  # simple gradient along x
         k_grad_y = key.diff(dim=2, append=key[:,:,-1:,:,:])
         k_grad_x = key.diff(dim=3, append=key[:,:,:,-1:,:])
 
-        qg = torch.cat([q_grad_x, q_grad_y], dim=-1).reshape(B, T, -1)
-        kg = torch.cat([k_grad_x, k_grad_y], dim=-1).reshape(B, T, -1)
+        qg = torch.cat([q_grad_x, q_grad_y], dim=-1).reshape(B, T_q, -1)
+        kg = torch.cat([k_grad_x, k_grad_y], dim=-1).reshape(B, T_k, -1)
         qg_norm = (qg ** 2).sum(dim=-1, keepdim=True)
         kg_norm = (kg ** 2).sum(dim=-1, keepdim=True)
         dist_sq = qg_norm + kg_norm.transpose(-1, -2) - 2 * torch.matmul(qg, kg.transpose(-1, -2))
@@ -224,7 +223,7 @@ class ScaledDotProductAttention_Operator(nn.Module):
         attn = torch.einsum('bhwct,btq->bhwcq', v, kx)  # (B, H, W, C, T)
         output = attn.permute(0, 4, 1, 2, 3)            # (B, T, H, W, C)
 
-        return output
+        return output, kx
 
 class AttentionOperator(nn.Module):
     def __init__(self, d_model, modes1, modes2, im_size, ky_kernel, icl_lr, kx_name, kx_sigma):
@@ -250,9 +249,10 @@ class AttentionOperator(nn.Module):
         value = self.value_operator(y)
 
         # NOTE: following assumes attention is computed with only 1 head
-        attn_y = self.scaled_dot_product_attention(query, key, value).reshape(batch, T, H, W, -1)
+        attn_results = self.scaled_dot_product_attention(query, key, value)
+        attn_y = attn_results[0].reshape(batch, T, H, W, -1)
         output = torch.cat((torch.zeros_like(x), attn_y), dim=2) # N x T x 2H x W x C
-        return output
+        return output, attn_results[1]
 
 
 def init_spectral_identity_weights(layer, modes1, modes2, scale=1.0):
@@ -271,8 +271,8 @@ class TransformerOperatorLayer(nn.Module):#
     def __init__(self, d_model, patch_size=1, im_size=64, icl_init=False, r_l=None, ky_kernel=None, kx_name=None, kx_sigma=1.0):
         super(TransformerOperatorLayer, self).__init__()
         
-        modes1 = 8 # patch_size // 2 + 1
-        modes2 = 8 # patch_size // 2 + 1
+        modes1 = patch_size // 2 + 1
+        modes2 = patch_size // 2 + 1
         
         self.patch_size = patch_size
         self.im_size    = im_size
@@ -287,8 +287,9 @@ class TransformerOperatorLayer(nn.Module):#
             init_spectral_identity_weights(self.self_attn.key_operator,     modes1, modes2, scale=1.0)
 
     def forward(self, z):
-        z = z + self.self_attn(z) # N x T x 2H x W x C
-        return z
+        z_delta, attn = self.self_attn(z)
+        z = z + z_delta # N x T x 2H x W x C
+        return z, attn
 
 
 class TransformerOperator(nn.Module):
@@ -318,10 +319,12 @@ class TransformerOperator(nn.Module):
         z = z.unsqueeze(-1)  # B x T x H x W x 1
 
         zs = []
+        attns = []
         for layer in self.layers:
-            z = layer(z) # B x T x 2H x W x 3
+            z, attn = layer(z) # B x T x 2H x W x 3
             zs.append(z.cpu().detach().numpy())
-        return z[:,-1,H//2:,:,0], zs    # B x 1 x H x W x 1 -- bottom right is prediction (in first channel)
+            attns.append(attn.cpu().detach().numpy())
+        return z[:,-1,H//2:,:,0], zs, np.array(attns)    # B x 1 x H x W x 1 -- bottom right is prediction (in first channel)
 
 def test_apply_spatial_conv_batch_equivalence():
     # Test configuration

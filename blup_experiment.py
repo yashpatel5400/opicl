@@ -47,13 +47,18 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
             icl_lr=-r, 
             icl_init=True).to(device)
 
-        _, preds = opformer(Z_test)
+        _, preds, _ = opformer(Z_test)
         test_preds = np.array([pred[0,-1,64:,:,0] for pred in preds])
         errors = np.array([np.linalg.norm(test_pred + Of_test) for test_pred in test_preds])
 
         kernel_to_preds[kx_name]  = test_preds
         kernel_to_errors[kx_name] = errors
-    return kernel_to_preds, kernel_to_errors
+
+    # Save the final prediction and target
+    kernel_to_final_preds = {kx_name: preds[-1] for kx_name, preds in kernel_to_preds.items()}
+    true_field = Of_test
+
+    return kernel_to_preds, kernel_to_errors, kernel_to_final_preds, true_field
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -66,14 +71,20 @@ if __name__ == "__main__":
     kx_names = ['linear', 'laplacian', 'gradient_rbf', 'energy']
 
     true_kx_to_preds, true_kx_to_errors = {}, {}
+    true_kx_to_final_preds = {}
+    true_kx_to_targets = {}
+
     for i, kx_name in enumerate(kx_names):
         row, col = divmod(i, 2)
         show_ylabel = (col == 0)  # Only left column
         show_xlabel = (row == 1)  # Only bottom row
-        kernel_to_preds, kernel_to_errors = main(axs[row, col], kx_name, show_xlabel=show_xlabel, show_ylabel=show_ylabel, seed=args.seed)
+
+        kernel_to_preds, kernel_to_errors, kernel_to_final_preds, Of_true = main(axs[row, col], kx_name, show_xlabel=show_xlabel, show_ylabel=show_ylabel, seed=args.seed)
 
         true_kx_to_preds[kx_name]  = kernel_to_preds
         true_kx_to_errors[kx_name] = kernel_to_errors
+        true_kx_to_final_preds[kx_name] = kernel_to_final_preds
+        true_kx_to_targets[kx_name] = Of_true
 
     os.makedirs("results", exist_ok=True)
     with open(os.path.join("results", f"preds_trial={args.seed}.pkl"), "wb") as f:
@@ -81,3 +92,9 @@ if __name__ == "__main__":
 
     with open(os.path.join("results", f"errors_trial={args.seed}.pkl"), "wb") as f:
         pickle.dump(true_kx_to_errors, f)
+
+    with open(os.path.join("results", f"final_preds_trial={args.seed}.pkl"), "wb") as f:
+        pickle.dump(true_kx_to_final_preds, f)
+
+    with open(os.path.join("results", f"targets_trial={args.seed}.pkl"), "wb") as f:
+        pickle.dump(true_kx_to_targets, f)

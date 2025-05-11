@@ -68,5 +68,41 @@ def main():
     os.makedirs("results", exist_ok=True)
     plt.savefig(os.path.join("results", "blup_final.png"), dpi=300, bbox_inches='tight')
 
+    # Visualization of predicted fields and true target
+    trial_idx = 0  # choose which trial to show (e.g. 0)
+
+    with open(os.path.join("results", f"final_preds_trial={trial_idx + 1}.pkl"), "rb") as f:
+        all_preds = pickle.load(f)
+
+    with open(os.path.join("results", f"targets_trial={trial_idx + 1}.pkl"), "rb") as f:
+        all_targets = pickle.load(f)
+
+    sns.set_theme(style="whitegrid", palette="colorblind", font_scale=1.2)
+
+    for kx_true in kx_names:
+        fig = plt.figure(figsize=(10, 4.2))  # smaller overall width
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1.8], wspace=0.1)
+
+        # Left: Truth
+        ax_true = fig.add_subplot(gs[0])
+        ax_true.imshow(all_targets[kx_true], cmap='viridis')
+        ax_true.set_title(f"{format_title(kx_true)} (Truth)", fontsize=16, fontweight='bold')
+        ax_true.axis("off")
+
+        # Right: 2×2 grid
+        grid = gs[1].subgridspec(2, 2, hspace=0.25, wspace=0.2)  # increase vertical spacing
+        for idx, kx_model in enumerate(kx_names):
+            ax = fig.add_subplot(grid[idx])
+            pred_img = -all_preds[kx_true][kx_model]
+            ax.imshow(pred_img, cmap='viridis')
+            ax.set_title(format_title(kx_model), fontsize=13)
+            ax.axis("off")
+
+        fig.subplots_adjust(left=0.03, right=0.97, top=0.90, bottom=0.08)  # tighter layout
+        save_path = os.path.join("results", f"preds_{kx_true}.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+
 if __name__ == "__main__":
     main()
