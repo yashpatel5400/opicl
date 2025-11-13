@@ -13,6 +13,40 @@ from opformer import TransformerOperator
 import kernels
 import dataset
 
+def compute_blup_prediction(f, Of, kx_true, ridge=1e-6):
+    num_samples = f.shape[0]
+    n_train = num_samples - 1
+
+    f_train = f[:n_train]       # f_1..f_n
+    f_test  = f[-1]             # f_{n+1}
+    u_train = Of[:n_train]      # u_1..u_n
+    u_test  = Of[-1]            # u_{n+1} (ground truth)
+
+    # Build K_x on training inputs
+    Kx = np.empty((n_train, n_train), dtype=np.float64)
+    for i in range(n_train):
+        for j in range(n_train):
+            Kx[i, j] = kx_true(f_train[i], f_train[j])
+
+    # Cross-covariance vector between test input and training inputs
+    k_vec = np.empty(n_train, dtype=np.float64)
+    for i in range(n_train):
+        k_vec[i] = kx_true(f_test, f_train[i])
+
+    # Solve K_x w^T = k^T  ->  w = K_x^{-1} k
+    # (we add a tiny ridge term for numerical stability)
+    Kx_reg = Kx + ridge * np.eye(n_train)
+    w = np.linalg.solve(Kx_reg, k_vec)   # shape (n_train,)
+
+    # BLUP prediction: u_blup = sum_i w_i * u_i
+    # tensordot over training index
+    u_blup = np.tensordot(w, u_train, axes=(0, 0))  # (H, W)
+
+    # BLUP error: ||u_blup - u_test||_2
+    blup_error = np.linalg.norm(u_blup - u_test)
+
+    return u_blup, blup_error
+
 def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
     H, W = 64, 64
     kernel_maps = kernels.Kernels(H, W)
@@ -29,7 +63,9 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
     
     f_test = f[-1]
     Of_test = Of[-1]
-
+    
+    _, blup_error = compute_blup_prediction(f, Of, kx_true)
+    
     im_size = (64, 64)
     device = "cuda"
     Z_test = dataset.construct_Z(f_test, Of, f, im_size, device)
@@ -53,6 +89,7 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
 
         kernel_to_preds[kx_name]  = test_preds
         kernel_to_errors[kx_name] = errors
+    kernel_to_errors["blup"] = np.repeat(blup_error, (num_layers,))
 
     # Save the final prediction and target
     kernel_to_final_preds = {kx_name: preds[-1] for kx_name, preds in kernel_to_preds.items()}

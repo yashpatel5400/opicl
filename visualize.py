@@ -20,7 +20,7 @@ def viz_errors(ax, kx_name_true, kernel_to_full_errors, show_xlabel=False, show_
     if show_ylabel:
         ax.set_ylabel(r"$\| u - \mathcal{O}f \|^2$", fontsize=14)
 
-    colors = sns.color_palette("colorblind", n_colors=4)
+    colors = sns.color_palette("colorblind", n_colors=5)
 
     for idx, kernel_name in enumerate(kernel_to_full_errors):
         mean = np.mean(kernel_to_full_errors[kernel_name], axis=0)
@@ -30,7 +30,8 @@ def viz_errors(ax, kx_name_true, kernel_to_full_errors, show_xlabel=False, show_
         lower = mean - std
         upper = mean + std
 
-        ax.plot(x, mean, label=kernel_name, linewidth=2.5, color=colors[idx])
+        kernel_name_label = kernel_name if kernel_name != "blup" else "BLUP"
+        ax.plot(x, mean, label=kernel_name_label, linewidth=2.5, color=colors[idx])
         ax.fill_between(x, lower, upper, alpha=0.3)
 
     ax.grid(True, which='both', linestyle='--', alpha=0.7)
@@ -53,7 +54,7 @@ def main():
     kx_name_to_full_errors = {}
     for kx_name_true in kx_names:
         kx_name_to_full_errors[kx_name_true] = {}
-        for kernel_name in kx_names:
+        for kernel_name in (kx_names + ["blup"]):
             kx_name_to_full_errors[kx_name_true][kernel_name] = np.array([full_error[kx_name_true][kernel_name] for full_error in full_errors])
 
     sns.set_theme(style="whitegrid", palette="muted", font_scale=1.2)
