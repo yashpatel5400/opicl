@@ -43,8 +43,8 @@ def main():
         "--dataset_type",
         type=str,
         default="random_operator",
-        choices=["random_operator", "heat"],
-        help="Visualization layout: original four-panel operator plots or single heat-equation plot.",
+        choices=["random_operator", "poisson"],
+        help="Visualization layout: original four-panel operator plots or single poisson-equation plot.",
     )
     parser.add_argument(
         "--trial_idx",
@@ -78,8 +78,8 @@ def main():
 
     sns.set_theme(style="whitegrid", palette="muted", font_scale=1.2)
 
-    if args.dataset_type == "heat":
-        # Use a single panel; curves show all kx choices on the heat-equation data
+    if args.dataset_type == "poisson":
+        # Use a single panel; curves show all kx choices on the poisson-equation data
         reference_true = kx_names[0]
         kernel_names = kx_names + ["blup"]
         kernel_to_full_errors = {
@@ -88,7 +88,7 @@ def main():
         }
 
         fig, ax = plt.subplots(1, 1, figsize=(7, 5))
-        viz_errors(ax, "heat_equation", kernel_to_full_errors, show_xlabel=True, show_ylabel=True, title_override="Heat Equation")
+        viz_errors(ax, "poisson_equation", kernel_to_full_errors, show_xlabel=True, show_ylabel=True, title_override="poisson Equation")
     else:
         kx_name_to_full_errors = {}
         for kx_name_true in kx_names:
@@ -120,14 +120,14 @@ def main():
 
     sns.set_theme(style="whitegrid", palette="colorblind", font_scale=1.2)
 
-    if args.dataset_type == "heat":
+    if args.dataset_type == "poisson":
         reference_true = kx_names[0]
         fig = plt.figure(figsize=(10, 4.2))
         gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1.8], wspace=0.1)
 
         ax_true = fig.add_subplot(gs[0])
         ax_true.imshow(all_targets[reference_true], cmap='viridis')
-        ax_true.set_title("Heat Equation (Truth)", fontsize=16, fontweight='bold')
+        ax_true.set_title("poisson Equation (Truth)", fontsize=16, fontweight='bold')
         ax_true.axis("off")
 
         grid = gs[1].subgridspec(2, 2, hspace=0.25, wspace=0.2)
@@ -139,7 +139,7 @@ def main():
             ax.axis("off")
 
         fig.subplots_adjust(left=0.03, right=0.97, top=0.90, bottom=0.08)
-        save_path = os.path.join("results", "preds_heat.png")
+        save_path = os.path.join("results", "preds_poisson.png")
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
 
@@ -150,15 +150,15 @@ def main():
         fig, axs = plt.subplots(2, num_pairs, figsize=(3 * num_pairs, 6))
         for idx in range(num_pairs):
             axs[0, idx].imshow(f_all[idx], cmap="viridis")
-            axs[0, idx].set_title(f"f_{idx+1}")
+            axs[0, idx].set_title(f"$f_{idx+1}$")
             axs[0, idx].axis("off")
 
             axs[1, idx].imshow(u_all[idx], cmap="viridis")
-            axs[1, idx].set_title(f"u_{idx+1}")
+            axs[1, idx].set_title(f"$u_{idx+1}$")
             axs[1, idx].axis("off")
-        fig.suptitle("Sample (f, u) pairs - Heat Equation", fontsize=16, fontweight="bold")
+        fig.suptitle("poisson Equation Samples $(f, u)$", fontsize=16, fontweight="bold")
         plt.tight_layout()
-        plt.savefig(os.path.join("results", "fu_pairs_heat.png"), dpi=300, bbox_inches="tight")
+        plt.savefig(os.path.join("results", "fu_pairs_poisson.png"), dpi=300, bbox_inches="tight")
         plt.close()
     else:
         for kx_true in kx_names:

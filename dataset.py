@@ -92,7 +92,7 @@ def solve_poisson_periodic(f):
     return u
 
 
-def make_heat_dataset(num_samples=25, H=64, W=64, seed=42, alpha=1.0, beta=1.0, gamma=4.0):
+def make_poisson_dataset(num_samples=25, H=64, W=64, seed=42, alpha=1.0, beta=1.0, gamma=4.0):
     """
     Sample forcing functions f from a GRF and generate solutions u to the
     2D Poisson problem Δu = f on a periodic grid.

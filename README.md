@@ -36,6 +36,8 @@ python visualize.py
 ```
 This will produce a "blup_final.png" file in the results/ directory.
 
+To reproduce the heat equation results, run the above commands with the `--dataset_type heat` flag.
+
 ## ⚖️ Disclaimer
 This project is intended for academic research, and we explicitly disclaim any responsibility for user-generated content. Users are solely liable for their actions while using the generative model. The project contributors have no legal affiliation with, nor accountability for, users' behaviors. It is imperative to use the generative model responsibly, adhering to both ethical and legal standards.
 

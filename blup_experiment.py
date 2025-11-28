@@ -65,12 +65,12 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0, dataset
         f, Of = dataset.make_random_operator_dataset(
             kx_true, ky_true, num_samples=num_samples, num_bases=10, seed=seed,
         )
-    elif dataset_type == "heat":
+    elif dataset_type == "poisson":
         blup_kernel_fn = kernels.get_kx_kernel(
             kx_name_true if blup_kx_name in (None, "all") else blup_kx_name,
             sigma=kx_sigma,
         )
-        f, Of = dataset.make_heat_dataset(num_samples=num_samples, H=H, W=W, seed=seed)
+        f, Of = dataset.make_poisson_dataset(num_samples=num_samples, H=H, W=W, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
     
@@ -117,8 +117,8 @@ if __name__ == "__main__":
         "--dataset_type",
         type=str,
         default="random_operator",
-        choices=["random_operator", "heat"],
-        help="Dataset source: synthetic operator (default) or PDE heat equation",
+        choices=["random_operator", "poisson"],
+        help="Dataset source: synthetic operator (default) or PDE poisson equation",
     )
     parser.add_argument(
         "--blup_kx_name",
