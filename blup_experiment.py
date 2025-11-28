@@ -108,7 +108,7 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0, dataset
     kernel_to_final_preds = {kx_name: preds[-1] for kx_name, preds in kernel_to_preds.items()}
     true_field = Of_test
 
-    return kernel_to_preds, kernel_to_errors, kernel_to_final_preds, true_field
+    return kernel_to_preds, kernel_to_errors, kernel_to_final_preds, true_field, f, Of
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -137,13 +137,14 @@ if __name__ == "__main__":
     true_kx_to_preds, true_kx_to_errors = {}, {}
     true_kx_to_final_preds = {}
     true_kx_to_targets = {}
+    true_kx_to_fu = {}
 
     for i, kx_name in enumerate(kx_names):
         row, col = divmod(i, 2)
         show_ylabel = (col == 0)  # Only left column
         show_xlabel = (row == 1)  # Only bottom row
 
-        kernel_to_preds, kernel_to_errors, kernel_to_final_preds, Of_true = main(
+        kernel_to_preds, kernel_to_errors, kernel_to_final_preds, Of_true, f_all, Of_all = main(
             axs[row, col],
             kx_name,
             show_xlabel=show_xlabel,
@@ -157,6 +158,7 @@ if __name__ == "__main__":
         true_kx_to_errors[kx_name] = kernel_to_errors
         true_kx_to_final_preds[kx_name] = kernel_to_final_preds
         true_kx_to_targets[kx_name] = Of_true
+        true_kx_to_fu[kx_name] = {"f": f_all, "u": Of_all}
 
     os.makedirs("results", exist_ok=True)
     with open(os.path.join("results", f"preds_trial={args.seed}.pkl"), "wb") as f:
@@ -170,3 +172,6 @@ if __name__ == "__main__":
 
     with open(os.path.join("results", f"targets_trial={args.seed}.pkl"), "wb") as f:
         pickle.dump(true_kx_to_targets, f)
+
+    with open(os.path.join("results", f"fu_pairs_trial={args.seed}.pkl"), "wb") as f:
+        pickle.dump(true_kx_to_fu, f)

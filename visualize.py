@@ -52,6 +52,12 @@ def main():
         default=0,
         help="Which trial index to use for field visualizations (0-based).",
     )
+    parser.add_argument(
+        "--num_fu_pairs",
+        type=int,
+        default=4,
+        help="Number of (f,u) pairs to visualize.",
+    )
     args = parser.parse_args()
 
     full_errors = []
@@ -109,6 +115,9 @@ def main():
     with open(os.path.join("results", f"targets_trial={trial_idx + 1}.pkl"), "rb") as f:
         all_targets = pickle.load(f)
 
+    with open(os.path.join("results", f"fu_pairs_trial={trial_idx + 1}.pkl"), "rb") as f:
+        fu_pairs = pickle.load(f)
+
     sns.set_theme(style="whitegrid", palette="colorblind", font_scale=1.2)
 
     if args.dataset_type == "heat":
@@ -133,6 +142,24 @@ def main():
         save_path = os.path.join("results", "preds_heat.png")
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
+
+        # (f,u) pairs visualization
+        f_all = fu_pairs[reference_true]["f"]
+        u_all = fu_pairs[reference_true]["u"]
+        num_pairs = min(args.num_fu_pairs, f_all.shape[0])
+        fig, axs = plt.subplots(2, num_pairs, figsize=(3 * num_pairs, 6))
+        for idx in range(num_pairs):
+            axs[0, idx].imshow(f_all[idx], cmap="viridis")
+            axs[0, idx].set_title(f"f_{idx+1}")
+            axs[0, idx].axis("off")
+
+            axs[1, idx].imshow(u_all[idx], cmap="viridis")
+            axs[1, idx].set_title(f"u_{idx+1}")
+            axs[1, idx].axis("off")
+        fig.suptitle("Sample (f, u) pairs - Heat Equation", fontsize=16, fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(os.path.join("results", "fu_pairs_heat.png"), dpi=300, bbox_inches="tight")
+        plt.close()
     else:
         for kx_true in kx_names:
             fig = plt.figure(figsize=(10, 4.2))  # smaller overall width
@@ -156,6 +183,24 @@ def main():
             fig.subplots_adjust(left=0.03, right=0.97, top=0.90, bottom=0.08)  # tighter layout
             save_path = os.path.join("results", f"preds_{kx_true}.png")
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            # (f,u) pairs visualization per kx_true
+            f_all = fu_pairs[kx_true]["f"]
+            u_all = fu_pairs[kx_true]["u"]
+            num_pairs = min(args.num_fu_pairs, f_all.shape[0])
+            fig, axs = plt.subplots(2, num_pairs, figsize=(3 * num_pairs, 6))
+            for idx in range(num_pairs):
+                axs[0, idx].imshow(f_all[idx], cmap="viridis")
+                axs[0, idx].set_title(f"f_{idx+1}")
+                axs[0, idx].axis("off")
+
+                axs[1, idx].imshow(u_all[idx], cmap="viridis")
+                axs[1, idx].set_title(f"u_{idx+1}")
+                axs[1, idx].axis("off")
+            fig.suptitle(f"Sample (f, u) pairs - {format_title(kx_true)}", fontsize=16, fontweight="bold")
+            plt.tight_layout()
+            plt.savefig(os.path.join("results", f"fu_pairs_{kx_true}.png"), dpi=300, bbox_inches="tight")
             plt.close()
 
 
