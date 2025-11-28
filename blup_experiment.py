@@ -47,19 +47,25 @@ def compute_blup_prediction(f, Of, kx_true, ridge=1e-6):
 
     return u_blup, blup_error
 
-def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
+def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0, dataset_type="random_operator", blup_kx_name=None):
     H, W = 64, 64
     kernel_maps = kernels.Kernels(H, W)
 
     kx_sigma = 1.0
     kx_names = ['linear', 'laplacian', 'gradient_rbf', 'energy']
-    kx_true = kernels.get_kx_kernel(kx_name_true, sigma=kx_sigma)
     ky_true = kernel_maps.get_kernel("gaussian")
 
     num_samples = 25
-    f, Of = dataset.make_random_operator_dataset(
-        kx_true, ky_true, num_samples=num_samples, num_bases=10, seed=seed,
-    )
+    if dataset_type == "random_operator":
+        kx_true = kernels.get_kx_kernel(kx_name_true, sigma=kx_sigma)
+        f, Of = dataset.make_random_operator_dataset(
+            kx_true, ky_true, num_samples=num_samples, num_bases=10, seed=seed,
+        )
+    elif dataset_type == "heat":
+        kx_true = kernels.get_kx_kernel(blup_kx_name or "laplacian", sigma=kx_sigma)
+        f, Of = dataset.make_heat_dataset(num_samples=num_samples, H=H, W=W, seed=seed)
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}")
     
     f_test = f[-1]
     Of_test = Of[-1]
@@ -100,6 +106,20 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--dataset_type",
+        type=str,
+        default="random_operator",
+        choices=["random_operator", "heat"],
+        help="Dataset source: synthetic operator (default) or PDE heat equation",
+    )
+    parser.add_argument(
+        "--blup_kx_name",
+        type=str,
+        default="laplacian",
+        choices=['linear', 'laplacian', 'gradient_rbf', 'energy'],
+        help="Kernel used for BLUP baseline when dataset_type=heat",
+    )
     args = parser.parse_args()
 
     sns.set_theme(style="whitegrid", palette="muted", font_scale=1.2)
@@ -116,7 +136,15 @@ if __name__ == "__main__":
         show_ylabel = (col == 0)  # Only left column
         show_xlabel = (row == 1)  # Only bottom row
 
-        kernel_to_preds, kernel_to_errors, kernel_to_final_preds, Of_true = main(axs[row, col], kx_name, show_xlabel=show_xlabel, show_ylabel=show_ylabel, seed=args.seed)
+        kernel_to_preds, kernel_to_errors, kernel_to_final_preds, Of_true = main(
+            axs[row, col],
+            kx_name,
+            show_xlabel=show_xlabel,
+            show_ylabel=show_ylabel,
+            seed=args.seed,
+            dataset_type=args.dataset_type,
+            blup_kx_name=args.blup_kx_name,
+        )
 
         true_kx_to_preds[kx_name]  = kernel_to_preds
         true_kx_to_errors[kx_name] = kernel_to_errors
