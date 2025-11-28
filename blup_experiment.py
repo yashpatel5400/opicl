@@ -58,11 +58,18 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0, dataset
     num_samples = 25
     if dataset_type == "random_operator":
         kx_true = kernels.get_kx_kernel(kx_name_true, sigma=kx_sigma)
+        blup_kernel_fn = kernels.get_kx_kernel(
+            kx_name_true if blup_kx_name in (None, "all") else blup_kx_name,
+            sigma=kx_sigma,
+        )
         f, Of = dataset.make_random_operator_dataset(
             kx_true, ky_true, num_samples=num_samples, num_bases=10, seed=seed,
         )
     elif dataset_type == "heat":
-        kx_true = kernels.get_kx_kernel(blup_kx_name or "laplacian", sigma=kx_sigma)
+        blup_kernel_fn = kernels.get_kx_kernel(
+            kx_name_true if blup_kx_name in (None, "all") else blup_kx_name,
+            sigma=kx_sigma,
+        )
         f, Of = dataset.make_heat_dataset(num_samples=num_samples, H=H, W=W, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
@@ -70,7 +77,7 @@ def main(ax, kx_name_true, show_xlabel=False, show_ylabel=False, seed=0, dataset
     f_test = f[-1]
     Of_test = Of[-1]
     
-    _, blup_error = compute_blup_prediction(f, Of, kx_true)
+    _, blup_error = compute_blup_prediction(f, Of, blup_kernel_fn)
     
     im_size = (64, 64)
     device = "cuda"
@@ -116,9 +123,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--blup_kx_name",
         type=str,
-        default="laplacian",
-        choices=['linear', 'laplacian', 'gradient_rbf', 'energy'],
-        help="Kernel used for BLUP baseline when dataset_type=heat",
+        default="all",
+        choices=['linear', 'laplacian', 'gradient_rbf', 'energy', 'all'],
+        help="Kernel used for BLUP baseline; 'all' matches each panel's kx_name_true",
     )
     args = parser.parse_args()
 
