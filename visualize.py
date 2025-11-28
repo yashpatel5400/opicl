@@ -88,7 +88,7 @@ def main():
         }
 
         fig, ax = plt.subplots(1, 1, figsize=(7, 5))
-        viz_errors(ax, "poisson_equation", kernel_to_full_errors, show_xlabel=True, show_ylabel=True, title_override="poisson Equation")
+        viz_errors(ax, "poisson_equation", kernel_to_full_errors, show_xlabel=True, show_ylabel=True, title_override="Poisson Equation")
     else:
         kx_name_to_full_errors = {}
         for kx_name_true in kx_names:
@@ -156,7 +156,7 @@ def main():
             axs[1, idx].imshow(u_all[idx], cmap="viridis")
             axs[1, idx].set_title(f"$u_{idx+1}$")
             axs[1, idx].axis("off")
-        fig.suptitle("poisson Equation Samples $(f, u)$", fontsize=16, fontweight="bold")
+        fig.suptitle("Poisson Equation Samples $(f, u)$", fontsize=16, fontweight="bold")
         plt.tight_layout()
         plt.savefig(os.path.join("results", "fu_pairs_poisson.png"), dpi=300, bbox_inches="tight")
         plt.close()
